@@ -331,7 +331,7 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
     } else {
         retval += encode_uint8( base, idx, 0 );
     }
-    retval += encode_uint16( base, idx, 0 );
+    retval += encode_uint16( base, idx, reg->aflags );
     retval += encode_uint16( base, idx, 0 );
     return retval;
 }
@@ -362,6 +362,7 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
             num_local--;
         }
     }
+    retval += decode_uint16( &(reg->aflags), base, rem, idx );
     retval += decode_uint16( &(reg->auth.scheme), base, rem, idx );
     retval += decode_uint16( &(reg->auth.toksize), base, rem, idx );
     /* Consume auth token data if present, up to buffer space */
@@ -640,6 +641,8 @@ size_t encode_PEER_INFO( uint8_t * base, size_t * idx,
     /* Append version and os_name for backward compat; old edges ignore extra bytes */
     retval += encode_buf( base, idx, pkt->version, sizeof(pkt->version) );
     retval += encode_buf( base, idx, pkt->os_name, sizeof(pkt->os_name) );
+    /* Append assigned_ip for backward compat; old edges ignore extra bytes */
+    retval += encode_uint32( base, idx, pkt->assigned_ip );
     return retval;
 }
 
@@ -666,6 +669,11 @@ size_t decode_PEER_INFO( n2n_PEER_INFO_t * pkt,
         retval += decode_buf( pkt->os_name, sizeof(pkt->os_name), base, rem, idx );
     else
         pkt->os_name[0] = '\0';
+    /* assigned_ip: optional, appended by new supernodes */
+    if ( *rem >= sizeof(pkt->assigned_ip) )
+        retval += decode_uint32( &pkt->assigned_ip, base, rem, idx );
+    else
+        pkt->assigned_ip = 0;
     return retval;
 }
 

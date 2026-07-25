@@ -163,7 +163,8 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
-#define N2N_AFLAGS_LOCAL_SOCKET  0x0001  /* local_sock field is valid */
+#define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
+#define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
 
 struct n2n_REGISTER_SUPER
 {
@@ -395,6 +396,7 @@ typedef struct n2n_PEER_INFO {
     n2n_sock_t sock6;       /* IPv6 public address (if N2N_AFLAGS_IPV6_SOCKET set) */
     char       version[8];  /* peer edge version string (optional, may be empty) */
     char       os_name[16]; /* peer OS name (optional, may be empty) */
+    uint32_t   assigned_ip; /* peer's n2n virtual LAN IP address (0 if unknown) */
 } n2n_PEER_INFO_t;
 
 size_t encode_PEER_INFO( uint8_t * base, size_t * idx,

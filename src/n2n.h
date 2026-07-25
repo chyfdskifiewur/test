@@ -434,6 +434,12 @@ struct n2n_edge
     n2n_sock_t          last_resolved_supernode;
     time_t              last_resolve_check;
 
+    /* "f" sync: lock mgmt input, take IP snapshot, compare vs PEER_INFO from SN */
+    int                 peer_sync_active;     /* 1 = sync in progress, mgmt locked */
+    time_t              peer_sync_time;       /* when sync started, for 2s timeout */
+    uint32_t            peer_sync_ips[256];   /* snapshot of local assigned_ips */
+    uint16_t            peer_sync_ips_count;  /* number of IPs in snapshot */
+
     /* Statistics */
     size_t              tx_p2p;
     size_t              rx_p2p;

@@ -1965,6 +1965,7 @@ static int process_udp( n2n_sn_t * sss,
                 strncpy(pi.os_name, target->os_name, sizeof(pi.os_name) - 1);
                 pi.os_name[sizeof(pi.os_name) - 1] = '\0';
             }
+            pi.assigned_ip = target->assigned_ip;
 
             encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
             {
@@ -2019,6 +2020,7 @@ static int process_udp( n2n_sn_t * sss,
                     strncpy(pi2.os_name, requester->os_name, sizeof(pi2.os_name) - 1);
                     pi2.os_name[sizeof(pi2.os_name) - 1] = '\0';
                 }
+                pi2.assigned_ip = requester->assigned_ip;
 
                 encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
                 /* Send to B via appropriate socket */
@@ -2086,6 +2088,7 @@ static int process_udp( n2n_sn_t * sss,
 
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
+        uint8_t force_peer_info = (reg.aflags & N2N_AFLAGS_FORCE_PEER_INFO) ? 1 : 0;
 
         /* Check IP conflict: different MAC, same IP in same community */
         if (use_request_ip && use_requested_ip != 0) {
@@ -2165,8 +2168,8 @@ static int process_udp( n2n_sn_t * sss,
                     sock_to_cstr( sockbuf, &(ack.sock) ),
                     ws_sender ? " (ws)" : "" );
 
-        /* Push all existing peers only when this is a NEW edge registration */
-        if ( is_new_edge )
+        /* Push all existing peers when this is a NEW edge registration or FORCE_PEER_INFO flag is set */
+        if ( is_new_edge || force_peer_info )
         {
             n2n_common_t    pi_cmn;
             n2n_PEER_INFO_t pi;
@@ -2212,6 +2215,7 @@ static int process_udp( n2n_sn_t * sss,
                     /* Include version and os_name so edge can display them */
                     strncpy(pi.version, p->version, sizeof(pi.version) - 1);
                     strncpy(pi.os_name, p->os_name, sizeof(pi.os_name) - 1);
+                    pi.assigned_ip = p->assigned_ip;
                     pix = 0;
                     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
                     if (ws_sender) {

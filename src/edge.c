@@ -370,6 +370,9 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
     memset(&eee->last_resolved_supernode, 0, sizeof(n2n_sock_t));
     eee->last_resolve_check = 0;
+    eee->peer_sync_active = 0;
+    eee->peer_sync_time = 0;
+    eee->peer_sync_ips_count = 0;
     eee->bp_proxy_port = 0; /* will use default */
     eee->bp = NULL;
     eee->bp_user_disabled = 1; /* default: bypass off */
@@ -1201,6 +1204,11 @@ static void send_register_super( n2n_edge_t * eee,
     if (eee->local_sock_ena) {
         reg.aflags    |= N2N_AFLAGS_LOCAL_SOCKET;
         reg.local_sock = eee->local_sock;
+    }
+
+    /* Request full peer list push when "f" sync is in progress */
+    if (eee->peer_sync_active) {
+        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
     }
 
     idx=0;
@@ -3039,6 +3047,16 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Handle commands */
+    if (eee->peer_sync_active) {
+        /* During "f" sync, only accept "stop" */
+        if (recvlen >= 4 && 0 == memcmp(udp_buf, "stop", 4)) {
+            traceEvent(TRACE_ERROR, "stop command received.");
+            *keep_running = 0;
+            return;
+        }
+        return; /* ignore all other input during sync */
+    }
+
     if (recvlen >= 2) {
         if (recvlen >= 4 && 0 == memcmp(udp_buf, "stop", 4)) {
             traceEvent(TRACE_ERROR, "stop command received.");
@@ -3055,7 +3073,54 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  +       Increase verbosity of logging\n"
                                 "  -       Decrease verbosity of logging\n"
                                 "  b       Toggle bypass on/off\n"
+                                "  f       Sync peers with supernode\n"
                                 "  <enter> Display statistics\n\n");
+            sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                   (struct sockaddr*) &sender_sock, i);
+            return;
+        }
+
+        if (recvlen >= 1 && 0 == memcmp(udp_buf, "f", 1)) {
+            msg_len = 0;
+            if (eee->peer_sync_active) {
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    "> sync already in progress, please wait\n");
+                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                       (struct sockaddr*) &sender_sock, i);
+                return;
+            }
+            /* Mark sync active to lock mgmt input */
+            eee->peer_sync_active = 1;
+            eee->peer_sync_time = n2n_now();
+            /* Snapshot all local peer assigned_ips */
+            {
+                struct peer_info *p;
+                uint16_t count = 0;
+                PEERS_LOCK(eee);
+                p = eee->pending_peers;
+                while (p && count < 256) {
+                    if (p->assigned_ip != 0)
+                        eee->peer_sync_ips[count++] = p->assigned_ip;
+                    p = p->next;
+                }
+                p = eee->known_peers;
+                while (p && count < 256) {
+                    if (p->assigned_ip != 0) {
+                        /* Don't snapshot peers that have active P2P */
+                        if (p->direct_seen == 0)
+                            eee->peer_sync_ips[count++] = p->assigned_ip;
+                    }
+                    p = p->next;
+                }
+                eee->peer_sync_ips_count = count;
+                PEERS_UNLOCK(eee);
+            }
+            /* Force REGISTER_SUPER - SN will push all peer info */
+            send_register_super(eee, &eee->supernode);
+            eee->sn_wait = 1;
+            eee->last_register_req = n2n_now();
+            msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                "> peer sync started...\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -3710,10 +3775,19 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s%s",
-                       macaddr_str(mac_buf1, pi.mac),
-                       sock_to_cstr(sockbuf1, &pi.sockets[0]),
-                       do_punch ? " [PUNCH]" : "");
+            if (pi.assigned_ip) {
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s%s",
+                           macaddr_str(mac_buf1, pi.mac),
+                           (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
+                           (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
+                           do_punch ? " [PUNCH]" : "");
+            } else {
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s%s",
+                           macaddr_str(mac_buf1, pi.mac),
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
+                           do_punch ? " [PUNCH]" : "");
+            }
 
             /* If peer is in same LAN as supernode, replace its private IP
              * with supernode's public IP (keeping peer's port). */
@@ -3733,8 +3807,24 @@ process_n2n_packet:
             struct peer_info *known = find_peer_by_mac(eee->known_peers, pi.mac);
             struct peer_info *pending = find_peer_by_mac(eee->pending_peers, pi.mac);
 
+            /* During "f" sync: remove this peer's IP from snapshot (confirms SN has it) */
+            if (eee->peer_sync_active && pi.assigned_ip != 0) {
+                uint16_t j;
+                for (j = 0; j < eee->peer_sync_ips_count; j++) {
+                    if (eee->peer_sync_ips[j] == pi.assigned_ip) {
+                        eee->peer_sync_ips[j] = eee->peer_sync_ips[--eee->peer_sync_ips_count];
+                        break;
+                    }
+                }
+            }
+
             if (!do_punch) {
                 if (known) {
+                    /* During "f" sync: preserve existing P2P, skip address change detection */
+                    if (eee->peer_sync_active && known->direct_seen != 0) {
+                        PEERS_UNLOCK(eee);
+                        return;
+                    }
                     int addr_changed = 0;
                     /* Principle 8+13: detect address change whenever P2P
                      * is idle (relay) or has been idle for >= 5 seconds.
@@ -3764,6 +3854,7 @@ process_n2n_packet:
                             known->sock6 = pi.sock6;
                         if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
                         if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                        if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
                         /* Do NOT update last_seen here — PEER_INFO is from the
                          * supernode, not from the peer itself. Updating last_seen
                          * would mask relay failures: if the relay is broken but
@@ -3802,6 +3893,7 @@ process_n2n_packet:
                         pending->sock6 = pi.sock6;
                     if (pi.version[0]) strncpy(pending->version, pi.version, sizeof(pending->version) - 1);
                     if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
+                    pending->assigned_ip = pi.assigned_ip;
                     pending->last_seen = n2n_now();
                     PEERS_UNLOCK(eee);
                     return;
@@ -3821,6 +3913,7 @@ process_n2n_packet:
                     pending->sock6 = pi.sock6;
                 if (pi.version[0]) strncpy(pending->version, pi.version, sizeof(pending->version) - 1);
                 if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
+                pending->assigned_ip = pi.assigned_ip;
                 pending->last_seen = n2n_now();
                 peer_list_add(&eee->pending_peers, pending);
                 PEERS_UNLOCK(eee);
@@ -3864,6 +3957,7 @@ process_n2n_packet:
                 pending->sock6 = pi.sock6;
             if (pi.version[0]) strncpy(pending->version, pi.version, sizeof(pending->version) - 1);
             if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
+            pending->assigned_ip = pi.assigned_ip;
             pending->last_seen = n2n_now();
             pending->punch_start_time = 0;
             pending->punch_failed = 0;
@@ -4048,7 +4142,7 @@ process_n2n_packet:
             }
             else
             {
-                traceEvent( TRACE_WARNING, "Rx REGISTER_SUPER_ACK with no outstanding REGISTER_SUPER." );
+                traceEvent( TRACE_INFO, "Rx REGISTER_SUPER_ACK (no pending req)." );
             }
         }
         else if(msg_type == n2n_deregister)
@@ -5794,6 +5888,63 @@ static int run_loop(n2n_edge_t * eee )
 
         PEERS_LOCK(eee);
         check_keepalive(eee, nowTime);
+
+        /* "f" sync cleanup: after 2s, remove peers in pending_peers that
+         * were in the snapshot but NOT confirmed by supernode. */
+        if (eee->peer_sync_active && (nowTime - eee->peer_sync_time) > 2) {
+            uint16_t i;
+            size_t removed = 0;
+            struct peer_info *prev, *scan;
+
+            for (i = 0; i < eee->peer_sync_ips_count; i++) {
+                prev = NULL;
+                scan = eee->pending_peers;
+                while (scan) {
+                    if (scan->assigned_ip == eee->peer_sync_ips[i]) {
+                        struct peer_info *next = scan->next;
+                        if (prev) prev->next = next;
+                        else eee->pending_peers = next;
+                        free(scan);
+                        scan = next;
+                        ++removed;
+                        break;
+                    }
+                    prev = scan;
+                    scan = scan->next;
+                }
+            }
+
+            /* Also remove relay-only known_peers not confirmed by SN */
+            for (i = 0; i < eee->peer_sync_ips_count; i++) {
+                prev = NULL;
+                scan = eee->known_peers;
+                while (scan) {
+                    if (scan->assigned_ip == eee->peer_sync_ips[i] && scan->direct_seen == 0) {
+                        struct peer_info *next = scan->next;
+                        if (prev) prev->next = next;
+                        else eee->known_peers = next;
+                        if (bypass_has_peers(eee->bp) && scan->assigned_ip != 0)
+                            bypass_peer_gone(eee->bp, scan->assigned_ip);
+                        free(scan);
+                        scan = next;
+                        ++removed;
+                        break;
+                    }
+                    prev = scan;
+                    scan = scan->next;
+                }
+            }
+
+            if (removed > 0) {
+                eee->cached_dst_valid = 0;
+                traceEvent(TRACE_NORMAL, "Peer sync removed %u stale peer(s)", (unsigned int)removed);
+            }
+            eee->peer_sync_active = 0;
+            eee->peer_sync_time = 0;
+            eee->peer_sync_ips_count = 0;
+            traceEvent(TRACE_NORMAL, "Peer sync complete");
+        }
+
         /* Before purging, clean up bypass state for peers about to be removed.
          * Save assigned_ip of all known peers, then after purge, check which
          * ones are gone and call bypass_peer_gone. */
