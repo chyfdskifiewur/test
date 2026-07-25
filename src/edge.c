@@ -373,6 +373,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->peer_sync_active = 0;
     eee->peer_sync_time = 0;
     eee->peer_sync_ips_count = 0;
+    eee->enable_gaming_mode = 0;
+    eee->gaming_started = 0;
     eee->bp_proxy_port = 0; /* will use default */
     eee->bp = NULL;
     eee->bp_user_disabled = 1; /* default: bypass off */
@@ -720,6 +722,7 @@ static void help() {
     printf("-u <UID>                 | User ID (numeric) to use when privileges are dropped.\n");
     printf("-g <GID>                 | Group ID (numeric) to use when privileges are dropped.\n");
 #endif /* ifndef _WIN32 */
+    printf("-G                       | Gaming mode: actively probe all peers to trigger P2P.\n");
 #ifdef N2N_HAVE_DAEMON
     printf("-f                       | Do not fork and run as a daemon; rather run in foreground.\n");
 #endif /* #ifdef N2N_HAVE_DAEMON */
@@ -1209,6 +1212,12 @@ static void send_register_super( n2n_edge_t * eee,
     /* Request full peer list push when "f" sync is in progress */
     if (eee->peer_sync_active) {
         reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
+    }
+
+    /* Gaming mode: first registration asks SN to push all peers */
+    if (eee->enable_gaming_mode && !eee->gaming_started) {
+        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
+        eee->gaming_started = 1;
     }
 
     idx=0;
@@ -2348,6 +2357,7 @@ static const struct option long_options[] = {
   { "help"   ,         no_argument,       NULL, 'h' },
   { "verbose",         no_argument,       NULL, 'v' },
   { "bypass",          optional_argument, NULL, 'b' },
+  { "gaming",          no_argument,       NULL, 'G' },
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -3896,6 +3906,26 @@ process_n2n_packet:
                     pending->assigned_ip = pi.assigned_ip;
                     pending->last_seen = n2n_now();
                     PEERS_UNLOCK(eee);
+                    if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
+                        uint8_t probe[42];
+                        memset(probe, 0, sizeof(probe));
+                        memset(probe, 0xFF, 6);
+                        memcpy(probe + 6, eee->device.mac_addr, 6);
+                        probe[12] = 0x08; probe[13] = 0x06;
+                        probe[14] = 0x00; probe[15] = 0x01;
+                        probe[16] = 0x08; probe[17] = 0x00;
+                        probe[18] = 6;    probe[19] = 4;
+                        probe[20] = 0x00; probe[21] = 0x01;
+                        memcpy(probe + 22, eee->device.mac_addr, 6);
+                        memcpy(probe + 28, &eee->device.ip_addr, 4);
+                        memset(probe + 32, 0, 6);
+                        uint32_t target_ip = htonl(pi.assigned_ip);
+                        memcpy(probe + 38, &target_ip, 4);
+                        send_packet2net(eee, probe, sizeof(probe));
+                        traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
+                                   (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
+                                   (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
+                    }
                     return;
                 }
                 pending = calloc(1, sizeof(struct peer_info));
@@ -3917,10 +3947,28 @@ process_n2n_packet:
                 pending->last_seen = n2n_now();
                 peer_list_add(&eee->pending_peers, pending);
                 PEERS_UNLOCK(eee);
+                if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
+                    uint8_t probe[42];
+                    memset(probe, 0, sizeof(probe));
+                    memset(probe, 0xFF, 6);
+                    memcpy(probe + 6, eee->device.mac_addr, 6);
+                    probe[12] = 0x08; probe[13] = 0x06;
+                    probe[14] = 0x00; probe[15] = 0x01;
+                    probe[16] = 0x08; probe[17] = 0x00;
+                    probe[18] = 6;    probe[19] = 4;
+                    probe[20] = 0x00; probe[21] = 0x01;
+                    memcpy(probe + 22, eee->device.mac_addr, 6);
+                    memcpy(probe + 28, &eee->device.ip_addr, 4);
+                    memset(probe + 32, 0, 6);
+                    uint32_t target_ip = htonl(pi.assigned_ip);
+                    memcpy(probe + 38, &target_ip, 4);
+                    send_packet2net(eee, probe, sizeof(probe));
+                    traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
+                               (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
+                               (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
+                }
                 return;
             }
-
-            /* --- PUNCH_REQUEST: start hole punching --- */
 
             if (known) {
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
@@ -5135,7 +5183,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     optarg = NULL;
     while((opt = getopt_long(argc,
         argv,
-        "46K:k:a:c:Eu:g:m:M:d:l:p:fvhrt:R:A:b::w", long_options, NULL
+        "46K:k:a:c:Eu:g:m:M:d:l:p:fvhrt:R:A:b::wG", long_options, NULL
     )) != EOF) {
         switch (opt) {
         case '4':
@@ -5296,6 +5344,10 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
         case 'w': /* WebSocket mode: relay via supernode over WS (TCP), disable P2P */
             eee.use_ws = 1;
+            break;
+
+        case 'G': /* Gaming mode: actively probe all peers on start */
+            eee.enable_gaming_mode = 1;
             break;
 
         } /* end switch */

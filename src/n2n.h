@@ -440,6 +440,10 @@ struct n2n_edge
     uint32_t            peer_sync_ips[256];   /* snapshot of local assigned_ips */
     uint16_t            peer_sync_ips_count;  /* number of IPs in snapshot */
 
+    /* Gaming mode (-G): actively probe peers to trigger P2P hole-punching */
+    int                 enable_gaming_mode;
+    int                 gaming_started;
+
     /* Statistics */
     size_t              tx_p2p;
     size_t              rx_p2p;
