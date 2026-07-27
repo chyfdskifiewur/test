@@ -90,8 +90,7 @@ typedef struct tuntap_dev {
 	NET_IFINDEX  ifIdx;
 	NET_LUID luid;
 	OVERLAPPED overlap_read, overlap_write;
-	CRITICAL_SECTION write_lock;
-	uint8_t      read_pending;     /* non-zero if an overlapped TAP read is in flight */
+    uint8_t      read_pending;     /* non-zero if an overlapped TAP read is in flight */
 	uint8_t      read_buf[2000]; /* persistent buffer for pending overlapped read */
 	bool         dyn_ip4;
 	uint8_t      mac_addr[6];

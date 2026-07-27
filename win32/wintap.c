@@ -316,8 +316,6 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
             continue;
         }
 
-        InitializeCriticalSection(&device->write_lock);
-
         found = 1;
         break;
     }
@@ -346,14 +344,7 @@ ssize_t tuntap_read(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
     }
     switch (last_err = GetLastError()) {
     case ERROR_IO_PENDING:
-        if (WaitForSingleObject(tuntap->overlap_read.hEvent, 1000) != WAIT_OBJECT_0) {
-            /* No data available within 1 second. Cancel the pending read
-             * so the OVERLAPPED structure is clean for the next call,
-             * then return -1 so the caller can re-check keep_running. */
-            CancelIo(tuntap->device_handle);
-            WaitForSingleObject(tuntap->overlap_read.hEvent, INFINITE);
-            return -1;
-        }
+        WaitForSingleObject(tuntap->overlap_read.hEvent, INFINITE);
         if (!GetOverlappedResult(tuntap->device_handle, &tuntap->overlap_read, &read_size, FALSE)) {
             DWORD last_err2 = GetLastError();
             if (last_err2 != ERROR_OPERATION_ABORTED && last_err2 != ERROR_INVALID_HANDLE) {
@@ -378,8 +369,6 @@ ssize_t tuntap_read(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
 ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
     uint32_t write_size;
 
-    EnterCriticalSection(&tuntap->write_lock);
-
     ResetEvent(tuntap->overlap_write.hEvent);
     if (WriteFile(tuntap->device_handle,
         buf,
@@ -387,7 +376,6 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
         &write_size,
         &tuntap->overlap_write))
     {
-        LeaveCriticalSection(&tuntap->write_lock);
         return (ssize_t) write_size;
     }
 
@@ -396,13 +384,11 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
         WaitForSingleObject(tuntap->overlap_write.hEvent, INFINITE);
         if (!GetOverlappedResult(tuntap->device_handle, &tuntap->overlap_write, &write_size, FALSE))
             write_size = 0;
-        LeaveCriticalSection(&tuntap->write_lock);
         return (ssize_t) write_size;
     default:
         break;
     }
 
-    LeaveCriticalSection(&tuntap->write_lock);
     return -1;
 }
 
@@ -413,9 +399,7 @@ void tuntap_close(struct tuntap_dev *tuntap) {
         tuntap->device_name[0] = '\0';
     }
     if (tuntap->device_handle != INVALID_HANDLE_VALUE) {
-        /* Cancel any pending I/O before closing the handle, so the TUN
-         * reader thread in tunReadThread can break out of WaitForSingleObject
-         * promptly rather than waiting for the 1-second timeout. */
+        /* Cancel pending I/O to wake up the TUN reader thread during shutdown. */
         CancelIo(tuntap->device_handle);
         CloseHandle(tuntap->device_handle);
         tuntap->device_handle = INVALID_HANDLE_VALUE;
