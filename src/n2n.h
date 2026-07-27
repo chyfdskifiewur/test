@@ -479,6 +479,7 @@ struct n2n_edge
     uint16_t            cached_hdr_len;
     uint8_t             cached_hdr_valid;   /* header is cached */
     size_t              cached_tx_transop;
+    uint8_t             cached_hdr_dst_mac[N2N_MAC_SIZE]; /* header cache dst mac (separate from dest cache) */
     /* Cached destination for send_PACKET (separate flag from header cache) */
     uint8_t             cached_dst_valid;   /* destination is cached */
     n2n_mac_t           cached_dst_mac;

@@ -61,7 +61,7 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
-#define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
+#define CACHE_DST_TTL                   30   /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -2576,7 +2576,7 @@ static void send_packet2net(n2n_edge_t * eee,
      * only variable (padded to fixed position). */
     if (eee->cached_hdr_valid &&
         eee->cached_tx_transop == tx_transop_idx &&
-        memcmp(eee->cached_dst_mac, destMac, N2N_MAC_SIZE) == 0)
+        memcmp(eee->cached_hdr_dst_mac, destMac, N2N_MAC_SIZE) == 0)
     {
         /* Fast path: reuse cached header + destination */
         memcpy(pktbuf, eee->cached_pkt_hdr, eee->cached_hdr_len);
@@ -2602,16 +2602,13 @@ static void send_packet2net(n2n_edge_t * eee,
         encode_PACKET( pktbuf, &idx, &cmn, &pkt );
 
         /* Cache the header template.
-         * IMPORTANT: cached_dst_mac is shared with the destination address cache
-         * in send_PACKET(). When we change it for a different peer, we must
-         * invalidate the destination cache to avoid sending the new peer's
-         * packet to the old peer's address. */
+         * Uses independent cached_hdr_dst_mac to avoid invalidating the
+         * destination address cache used by send_PACKET(). */
         eee->cached_hdr_len = (uint16_t)idx;
         memcpy(eee->cached_pkt_hdr, pktbuf, idx);
-        memcpy(eee->cached_dst_mac, destMac, N2N_MAC_SIZE);
+        memcpy(eee->cached_hdr_dst_mac, destMac, N2N_MAC_SIZE);
         eee->cached_tx_transop = tx_transop_idx;
         eee->cached_hdr_valid = 1;
-        eee->cached_dst_valid = 0; /* dest cache key is now stale */
     }
     traceEvent( TRACE_DEBUG, "encoded PACKET header of size=%u transform %u (idx=%u)",
                 (unsigned int)idx, (unsigned int)eee->transop[tx_transop_idx].transform_id, (unsigned int)tx_transop_idx );
