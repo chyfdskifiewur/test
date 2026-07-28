@@ -84,6 +84,12 @@ typedef unsigned long in_addr_t;
 
 #define N2N_IFNAMSIZ MAX_ADAPTER_NAME_LENGTH /* 256 */
 
+#define N2N_WRITE_QUEUE_SIZE 256
+struct win_write_packet {
+    uint8_t buf[1600];
+    size_t len;
+};
+
 typedef struct tuntap_dev {
 	HANDLE device_handle;
 	wchar_t  device_name[40]; /* legnth of a CLSID is 38 */
@@ -101,6 +107,15 @@ typedef struct tuntap_dev {
 	uint32_t     mtu;
     uint8_t      routes_count;
     struct route* routes;
+
+    /* Write queue + background write thread */
+    CRITICAL_SECTION write_lock;
+    struct win_write_packet write_queue[N2N_WRITE_QUEUE_SIZE];
+    volatile int write_queue_head;
+    volatile int write_queue_tail;
+    HANDLE write_event;
+    HANDLE write_thread;
+    volatile bool write_thread_running;
 } tuntap_dev;
 
 #define W32_ERROR(rc, error_string) \
