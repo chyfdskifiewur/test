@@ -1605,7 +1605,30 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
              * reflects the time since we last received a packet FROM the peer.
              * If idle > 60s and we haven't recently re-registered (30s rate
              * limit), force supernode re-registration + query peer to
-             * re-discover the peer's status. */
+             * re-discover the peer's status.
+             * While relayed, send periodic gratuitous ARP (~10s) to keep
+              * NAT mappings fresh on intermediate routers (gaming mode only). */
+             if (eee->enable_gaming_mode && idle >= 10 &&
+                 (scan->last_probe_sent == 0 || (now - scan->last_probe_sent) >= 10)) {
+                /* Send GARP through relay to keep NAT alive */
+                uint8_t arp[42];
+                memset(arp, 0, sizeof(arp));
+                memcpy(arp,   scan->mac_addr, 6);              /* dst: peer's MAC */
+                memcpy(arp+6, eee->device.mac_addr, 6);        /* src: our MAC */
+                arp[12] = 0x08; arp[13] = 0x06;                /* EtherType: ARP */
+                arp[14] = 0x00; arp[15] = 0x01;                /* HW type: Ethernet */
+                arp[16] = 0x08; arp[17] = 0x00;                /* Protocol: IPv4 */
+                arp[18] = 6;    arp[19] = 4;                   /* HW size, Proto size */
+                arp[20] = 0x00; arp[21] = 0x02;                /* Opcode: Reply (gratuitous) */
+                memcpy(arp+22, eee->device.mac_addr, 6);       /* sender MAC: ours */
+                memcpy(arp+28, &eee->device.ip_addr, 4);       /* sender IP: ours */
+                memcpy(arp+32, scan->mac_addr, 6);             /* target MAC: peer */
+                memcpy(arp+38, &eee->device.ip_addr, 4);       /* target IP: ours (gratuitous) */
+                send_packet2net(eee, arp, sizeof(arp));
+                scan->last_probe_sent = now;
+                traceEvent(TRACE_DEBUG, "Relay GARP sent to %s (idle %lds)",
+                           macaddr_str(mac_tmp, scan->mac_addr), (long)idle);
+            }
             if (idle > 60 && (now - eee->last_register_req) > 30) {
                 traceEvent(TRACE_NORMAL, "Relay check: peer %s unreachable for %lds, querying supernode",
                            PEER_ID(mac_tmp, scan), (long)idle);
