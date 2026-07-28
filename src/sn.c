@@ -1381,7 +1381,7 @@ static int process_mgmt( n2n_sn_t * sss,
             struct community_stats *cs = sss->comm_stats;
             while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
                 cs = cs->next;
-            if (cs && cs->total_30d > 0) {
+            if (cs && (now - cs->last_active) < 86400 && cs->total_30d > 0) {
                 double kbps   = cs->instant_Bps / 1024.0;
                 double gb_24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                 double gb_30d = cs->total_30d / (1024.0*1024.0*1024.0);
@@ -1441,8 +1441,15 @@ static int process_mgmt( n2n_sn_t * sss,
             {
                 n2n_sock_str_t sbuf, sbuf6;
                 char wan[64];
-                snprintf(wan, sizeof(wan), "%s", sock_to_cstr(sbuf, &edge->sock));
-                if (edge->sock6.family != 0) {
+                if (edge->sock.family != 0) {
+                    snprintf(wan, sizeof(wan), "%s", sock_to_cstr(sbuf, &edge->sock));
+                } else if (edge->sock6.family != 0) {
+                    snprintf(wan, sizeof(wan), "%s", sock_to_cstr(sbuf6, &edge->sock6));
+                } else {
+                    wan[0] = '\0';
+                }
+                /* Also append secondary IPv6 when both families available */
+                if (edge->sock6.family != 0 && edge->sock.family != 0) {
                     const char *v6 = sock_to_cstr(sbuf6, &edge->sock6);
                     size_t cur = strlen(wan);
                     int budget = 47 - (int)cur - 1; /* column width - primary - '/' */
@@ -1482,6 +1489,8 @@ static int process_mgmt( n2n_sn_t * sss,
     num_edges = displayed_edges;
 
     /* Offline communities: in comm_stats but no current edges */
+    /* Show individually if has recent 24h traffic, else aggregate into Older Offline */
+    double older_kbps = 0.0, older_24h = 0.0, older_30d = 0.0;
     if (sss->traffic_stats_enabled) {
         struct community_stats *cs = sss->comm_stats;
         while (cs) {
@@ -1493,22 +1502,41 @@ static int process_mgmt( n2n_sn_t * sss,
                 }
             }
             if (!online) {
-                time_t idle = now - cs->last_active;
-                if (idle < 86400) {
-                    /* Offline < 24h: show individually */
-                    double kbps  = cs->instant_Bps / 1024.0;
-                    double gb24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
-                    double gb30d = cs->total_30d / (1024.0*1024.0*1024.0);
+                double kbps  = cs->instant_Bps / 1024.0;
+                double gb24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+                double gb30d = cs->total_30d / (1024.0*1024.0*1024.0);
+                if (now - cs->last_second >= COMM_STATS_SECONDS)
+                    kbps = 0.0;
+
+                if ((now - cs->last_active) < 86400 && cs->total_30d > 0) {
+                    /* Has recent activity: show individually */
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                        "%-57.16s       %-7.1f  %-7.1f  %-10.1f\n",
                                        cs->community_name, kbps, gb24h, gb30d);
                     r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
                     if (r <= 0) return -1;
+                } else if (cs->total_30d > 0) {
+                     /* No recent activity: aggregate into Older Offline (24h=0) */
+                     older_kbps += kbps;
+                     older_30d  += gb30d;
+                 }
+            } else {
+                /* Online community: if it didn't show a traffic line, contribute to Older */
+                if ((now - cs->last_active) >= 86400 && cs->total_30d > 0) {
+                    older_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
                 }
-                /* Offline >= 24h: skip, no display */
             }
             cs = cs->next;
         }
+    }
+
+    /* Older Offline: aggregated stats for offline groups with no 24h traffic */
+    if (sss->traffic_stats_enabled && (older_30d > 0.001 || older_24h > 0.001)) {
+        ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                                   "%-57.16s       %-7.1f  %-7.1f  %-10.1f\n",
+                                   "Offline_over_24h", 0.0, 0.0, older_30d);
+        r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
+        if (r <= 0) return -1;
     }
 
     /* Traffic Total line - before the footer separator */
@@ -1518,14 +1546,15 @@ static int process_mgmt( n2n_sn_t * sss,
         while (cs) {
             total_kbps += (now - cs->last_second >= COMM_STATS_SECONDS)
                           ? 0.0 : (cs->instant_Bps / 1024.0);
-            total_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+            if ((now - cs->last_active) < 86400)
+                total_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
             total_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
             cs = cs->next;
         }
         if (total_30d > 0 || total_24h > 0 || total_kbps > 0) {
             const char *tarrow = (total_kbps >= 0.1) ? "--->" : "    ";
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                               "-------------\n"
+                               "----------------\n"
                                "Total traffic                                              %s %-7.1f  %-7.1f  %-10.1f\n",
                                tarrow, total_kbps, total_24h, total_30d);
             sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
