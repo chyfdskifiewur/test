@@ -1205,7 +1205,7 @@ void bypass_start_negotiation(bypass_context_t *ctx, struct peer_info *peer)
 
     /* Principle 10: wait at least 2 seconds after P2P establishment
      * before starting bypass negotiation ("旁路只是备选项"). */
-    if (n2n_now() - peer->direct_seen < 2)
+    if (n2n_now() - peer->p2p_est_time < 2)
         return;
 
     bypass_peer_entry_t *pe = bypass_find_peer(ctx, peer->assigned_ip);

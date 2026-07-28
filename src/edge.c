@@ -5043,7 +5043,7 @@ static void check_delayed_bypass(n2n_edge_t *eee, time_t now)
     if (!eee->bp) return;
     struct peer_info *scan = eee->known_peers;
     while (scan) {
-        if (scan->direct_seen > 0 && (now - scan->direct_seen) >= 2 &&
+        if (scan->p2p_est_time > 0 && (now - scan->p2p_est_time) >= 2 &&
             scan->assigned_ip != 0)
         {
             bypass_start_negotiation(eee->bp, scan);
