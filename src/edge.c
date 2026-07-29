@@ -5470,12 +5470,17 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     /* Check if supernode is domain name, enable periodic re-resolution */
     {
         char *sn_host = eee.sn_ip_array[eee.sn_idx];
+        char host_only[N2N_EDGE_SN_HOST_SIZE];
+        strncpy(host_only, sn_host, sizeof(host_only) - 1);
+        host_only[sizeof(host_only) - 1] = '\0';
+        char *colon = strchr(host_only, ':');
+        if (colon) *colon = '\0';
         struct in_addr ipv4_addr;
         struct in6_addr ipv6_addr;
-        if (inet_pton(AF_INET, sn_host, &ipv4_addr) != 1 &&
-            inet_pton(AF_INET6, sn_host, &ipv6_addr) != 1) {
+        if (inet_pton(AF_INET, host_only, &ipv4_addr) != 1 &&
+            inet_pton(AF_INET6, host_only, &ipv6_addr) != 1) {
             eee.re_resolve_supernode_ip = 1;
-            traceEvent(TRACE_INFO, "Supernode '%s' is a domain name, enabling periodic resolution", sn_host);
+            traceEvent(TRACE_INFO, "'%s', enabling periodic resolution", sn_host);
         }
     }
 
