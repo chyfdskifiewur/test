@@ -26,6 +26,7 @@
 #  include <ws2tcpip.h>
 #  include <mswsock.h>
 #  include <iphlpapi.h>
+#  include <process.h> /* _beginthreadex */
 #  pragma comment(lib, "iphlpapi.lib")
 #  pragma comment(lib, "ws2_32.lib")
 #  define close(s)               closesocket(s)
@@ -45,6 +46,7 @@ typedef int socklen_t;
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <netdb.h>
+#  include <pthread.h>
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1020,6 +1022,77 @@ void upnp_unmap_port(uint16_t external_port)
     upnp_igd_map(external_port, external_port, NULL, 1);
     pcp_map(external_port, external_port, NULL, 1);
     natpmp_map(external_port, external_port, NULL, 1);
+}
+
+/* Worker thread for upnp_unmap_port_async. */
+typedef struct {
+    uint16_t port;
+    volatile int done;
+} upnp_unmap_args_t;
+
+static void *upnp_unmap_worker(void *arg)
+{
+    upnp_unmap_args_t *a = (upnp_unmap_args_t *)arg;
+    uint16_t port = a->port;
+
+    upnp_igd_map(port, port, NULL, 1);
+    pcp_map(port, port, NULL, 1);
+    natpmp_map(port, port, NULL, 1);
+
+    a->done = 1;
+    return NULL;
+}
+
+void upnp_unmap_port_async(uint16_t external_port)
+{
+    /* Run the potentially slow unmap in a worker thread. Wait up to 1 second
+     * for it to finish — on a normal WiFi/UPnP router the unmap completes in
+     * tens of milliseconds, so this keeps the mapping cleaned up on shutdown.
+     * If the router is unreachable, give up after 1s and let the process exit;
+     * the mapping is then removed by the router's own lease expiry. */
+    upnp_unmap_args_t *a = (upnp_unmap_args_t *)malloc(sizeof(*a));
+    if (!a) {
+        /* Out of memory: fall back to synchronous (rare, still correct) */
+        upnp_unmap_port(external_port);
+        return;
+    }
+    a->port = external_port;
+    a->done = 0;
+
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_beginthreadex(NULL, 0, (unsigned (__stdcall *)(void *))upnp_unmap_worker, a, 0, NULL);
+    if (!h) {
+        upnp_unmap_port(external_port);
+        free(a);
+        return;
+    }
+    if (WaitForSingleObject(h, 1000) == WAIT_OBJECT_0) {
+        CloseHandle(h);
+        free(a);
+    } else {
+        /* Timed out: detach and let it finish in the background (or be
+         * killed at process exit). Mapping cleaned by router lease. */
+        CloseHandle(h);
+    }
+#else
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, upnp_unmap_worker, a) != 0) {
+        upnp_unmap_port(external_port);
+        free(a);
+        return;
+    }
+    /* Wait up to 1s (poll the done flag) */
+    for (int i = 0; i < 100 && !a->done; i++) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
+    if (a->done) {
+        pthread_join(tid, NULL);
+        free(a);
+    } else {
+        pthread_detach(tid); /* timed out: let it finish in background */
+    }
+#endif
 }
 
 int upnp_renew_port(uint16_t internal_port, uint16_t external_port)

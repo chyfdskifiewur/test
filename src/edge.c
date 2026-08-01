@@ -61,7 +61,7 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
-#define CACHE_DST_TTL                   30   /* sec: cached P2P destination TTL */
+#define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -656,9 +656,11 @@ static void edge_deinit(n2n_edge_t * eee)
     if (eee->mgmt_sock != -1) closesocket(eee->mgmt_sock);
 
     if (eee->upnp_mapped_port != 0) {
-        traceEvent(TRACE_NORMAL, "Removing upnp port mapping for port %u",
+        traceEvent(TRACE_NORMAL, "Removing upnp port mapping for port %u (async)",
                    (unsigned)eee->upnp_mapped_port);
-        upnp_unmap_port(eee->upnp_mapped_port);
+        /* Async: don't block shutdown on slow UPnP/NAT-PMP/PCP timeouts.
+         * The mapping cleanup runs in a detached worker thread. */
+        upnp_unmap_port_async(eee->upnp_mapped_port);
         eee->upnp_mapped_port = 0;
     }
 

@@ -46,4 +46,12 @@ int upnp_renew_port(uint16_t internal_port, uint16_t external_port);
  */
 void upnp_unmap_port(uint16_t external_port);
 
+/**
+ * Asynchronously delete a port mapping. Starts a detached worker thread
+ * and returns immediately — used at shutdown so the caller (e.g. the
+ * main/UI thread) is never blocked by slow UPnP/NAT-PMP/PCP timeouts.
+ * The worker is best-effort: if it cannot complete it is simply dropped.
+ */
+void upnp_unmap_port_async(uint16_t external_port);
+
 #endif /* _N2N_UPNP_H_ */
