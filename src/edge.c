@@ -677,7 +677,7 @@ static void edge_deinit(n2n_edge_t * eee)
 #endif
 }
 
-static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd );
+static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd );
 
 static void readFromMgmtSocket( n2n_edge_t * eee, int * keep_running );
 
@@ -3446,8 +3446,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
            (struct sockaddr*) &sender_sock, i);
 }
 
-/** Read a datagram from the main UDP socket to the internet. */
-static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
+/** Read a datagram from the main UDP socket to the internet.
+ *  @return 1 if a packet was read (caller should try to read more),
+ *          0 if no more data is available (queue drained). */
+static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
 {
     n2n_common_t        cmn; /* common fields in the packet header */
     static int          first_ok_message_shown = 0;
@@ -3476,9 +3478,9 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
         if (recvlen < 0) {
             ws_close(&eee->ws_conn);
             eee->ws_last_reconnect = n2n_now();
-            return;
+            return 0;
         }
-        if (recvlen == 0) return;
+        if (recvlen == 0) return 0;
         sender = eee->supernode;
         orig_sender = &sender;
         goto process_n2n_packet;
@@ -3501,7 +3503,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
         traceEvent(TRACE_DEBUG, "recvfrom failed with %s", strerror(errno) );
 #endif
 
-        return; /* failed to receive data from UDP */
+        return 0; /* failed to receive data from UDP — queue drained or error */
     }
 
     /* Determine sender address from socket family */
@@ -3575,7 +3577,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                 bypass_handle_recv(eee->bp, db, (size_t)dlen, &ds);
             }
         }
-        return;
+        return 1; /* bypass packet processed, may be more queued */
     }
 
 process_n2n_packet:
@@ -3587,7 +3589,7 @@ process_n2n_packet:
     if ( decode_common(&cmn, udp_buf, &rem, &idx) < 0 )
     {
         traceEvent( TRACE_ERROR, "Failed to decode common section in N2N_UDP" );
-        return; /* failed to decode packet */
+        return 0; /* failed to decode packet */
     }
 
     now = n2n_now();
@@ -4257,13 +4259,15 @@ process_n2n_packet:
         {
             /* Not a known message type */
             traceEvent(TRACE_WARNING, "Unable to handle packet type %d: ignored", (signed int)msg_type);
-            return;
+            return 0;
         }
     } /* if (community match) */
     else
     {
         traceEvent(TRACE_WARNING, "Received packet with invalid community");
     }
+
+    return 1; /* packet processed, may be more queued */
 }
 
 /* ***************************************************** */
@@ -5798,16 +5802,20 @@ static int run_loop(n2n_edge_t * eee )
             /* Any or all of the FDs could have input; check them all. */
             if(FD_ISSET(eee->udp_sock, &socket_mask))
             {
-                readFromIPSocket(eee, eee->udp_sock);
-                for (int _di = 0; _di < 4; _di++)
-                    readFromIPSocket(eee, eee->udp_sock);
+                /* Drain UDP queue: read until no more packets (non-blocking).
+                 * 128 cap prevents starvation of other FDs (TAP, mgmt, etc). */
+                for (int _di = 0; _di < 128; _di++) {
+                    if (!readFromIPSocket(eee, eee->udp_sock))
+                        break;
+                }
             }
 
             if(eee->udp_sock6 != -1 && FD_ISSET(eee->udp_sock6, &socket_mask))
             {
-                readFromIPSocket(eee, eee->udp_sock6);
-                for (int _di = 0; _di < 4; _di++)
-                    readFromIPSocket(eee, eee->udp_sock6);
+                for (int _di = 0; _di < 128; _di++) {
+                    if (!readFromIPSocket(eee, eee->udp_sock6))
+                        break;
+                }
             }
 
             /* WS mode: handle WebSocket fd read */
