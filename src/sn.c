@@ -1381,17 +1381,25 @@ static int process_mgmt( n2n_sn_t * sss,
             struct community_stats *cs = sss->comm_stats;
             while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
                 cs = cs->next;
-            if (cs && (now - cs->last_active) < 86400 && cs->total_30d > 0) {
+            if (cs) {
                 double kbps   = cs->instant_Bps / 1024.0;
                 double gb_24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                 double gb_30d = cs->total_30d / (1024.0*1024.0*1024.0);
                 /* Zero out KB/s if no traffic in last COMM_STATS_SECONDS */
                 if (now - cs->last_second >= COMM_STATS_SECONDS)
                     kbps = 0.0;
-                const char *arrow = (kbps >= 0.1) ? "--->" : "    ";
-                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                   "%-57.16s  %s %-7.1f  %-7.1f  %-10.1f\n",
-                                   communities[i], arrow, kbps, gb_24h, gb_30d);
+                /* Show the traffic line when there is current throughput OR a
+                  * visible 30-day total (>= 0.1 GB). A community with no
+                  * throughput and no meaningful history would display
+                  * "0.0  0.0  0.0" — hide it and show the name only. */
+                if (kbps > 0.0 || gb_30d >= 0.1) {
+                    const char *arrow = (kbps >= 0.1) ? "--->" : "    ";
+                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                                       "%-57.16s  %s %-7.1f  %-7.1f  %-10.1f\n",
+                                       communities[i], arrow, kbps, gb_24h, gb_30d);
+                } else {
+                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+                }
             } else {
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
             }
@@ -1508,15 +1516,17 @@ static int process_mgmt( n2n_sn_t * sss,
                 if (now - cs->last_second >= COMM_STATS_SECONDS)
                     kbps = 0.0;
 
-                if ((now - cs->last_active) < 86400 && cs->total_30d > 0) {
-                    /* Has recent activity: show individually */
+                /* Show individually only when there is current throughput or a
+                  * visible 30-day total (>= 0.1 GB). Otherwise it would print
+                  * "0.0  0.0  0.0" — aggregate silently instead. */
+                if (kbps > 0.0 || gb30d >= 0.1) {
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                        "%-57.16s       %-7.1f  %-7.1f  %-10.1f\n",
                                        cs->community_name, kbps, gb24h, gb30d);
                     r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
                     if (r <= 0) return -1;
-                } else if (cs->total_30d > 0) {
-                     /* No recent activity: aggregate into Older Offline (24h=0) */
+                } else if (gb30d > 0.0) {
+                     /* Tiny/no recent traffic: aggregate into Older Offline */
                      older_kbps += kbps;
                      older_30d  += gb30d;
                  }
@@ -1551,7 +1561,7 @@ static int process_mgmt( n2n_sn_t * sss,
             total_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
             cs = cs->next;
         }
-        if (total_30d > 0 || total_24h > 0 || total_kbps > 0) {
+        if (total_kbps > 0 || total_30d >= 0.1) {
             const char *tarrow = (total_kbps >= 0.1) ? "--->" : "    ";
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                "----------------\n"

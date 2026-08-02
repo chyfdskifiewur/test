@@ -61,7 +61,6 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
-#define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -1720,11 +1719,6 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->last_probe_sent    = 0;
                     scan->p2p_logged         = 0;
                     scan->psp_logged         = 0;
-                    /* Invalidate destination cache so TAP thread doesn't send
-                     * to the dead P2P address. Must match this peer's MAC. */
-                    if (eee->cached_dst_valid &&
-                        memcmp(eee->cached_dst_mac, scan->mac_addr, N2N_MAC_SIZE) == 0)
-                        eee->cached_dst_valid = 0;
                     send_query_peer(eee, scan->mac_addr);
                     start_punch(eee, scan);
                     /* Force immediate supernode re-registration so the
@@ -2034,8 +2028,6 @@ void set_peer_operational( n2n_edge_t * eee,
         /* Start bypass negotiation for this peer if applicable.
          * Delayed by 2 seconds after P2P establishment (principle 10):
          * the actual check happens in the main loop via check_delayed_bypass(). */
-
-        eee->cached_dst_valid = 0;
 
     } else {
         /* Peer not in pending_peers - check if already in known_peers (late REGISTER_ACK) */
@@ -2404,60 +2396,25 @@ static int send_PACKET( n2n_edge_t * eee,
 
     now = n2n_now();
 
-    /* Use cached destination if it matches and is still fresh (TTL check).
-     * Cache only for P2P direct (never relay). TTL ensures we periodically
-     * re-evaluate via find_peer_destination, keeping NAT changes detected.
+    /* No destination cache: look up the current destination on every packet.
+     * The peer table always holds the freshest address (updated by the main
+     * loop via PACKET piggybacking / REGISTER), so a restarted or NAT-mapped
+     * peer is reached immediately, without waiting for a stale cache to expire.
      *
      * WS mode: completely disable P2P, force relay via supernode.
      *
-     * Windows: TAP thread must never block on PEERS_LOCK (causes packet loss).
-     * Use TryEnterCriticalSection: if lock is held by main loop, use stale
-     * cache instead of blocking. Stale cache is safe — worst case we send
-     * a few packets to an old P2P address (they'll be lost, same as if
-     * P2P just died). Main loop will update peer state and cache eventually. */
+     * Windows: TAP thread briefly blocks on PEERS_LOCK if the main loop
+     * holds it — contention windows are microseconds (find_peer_destination
+     * is a short list scan). Blocking is preferable to relaying: dropping a
+     * packet to relay on lock contention would corrupt the P2P path. The
+     * actual UDP send happens after the lock is released. */
     if (eee->use_ws) {
         dest = 0;
         destination = eee->supernode;
         ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
-    } else if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
-        memcmp(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE) == 0 &&
-        (now - eee->cached_dst_time) < CACHE_DST_TTL)
-    {
-        /* Cache is fresh — use without lock */
-        dest = 1;
-        destination = eee->cached_dst_sock;
-        ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
     } else {
-#ifdef _WIN32
-        /* Windows: TAP thread must not block. Try lock, use stale cache if contended. */
-        int got_lock = TryEnterCriticalSection(&eee->peers_lock);
-        if (got_lock) {
-            dest = find_peer_destination(eee, dstMac, &destination);
-            if (dest) { ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen; }
-            else { ++(eee->tx_sup); eee->super_tx_bytes += pktlen; destination = eee->supernode; }
-            LeaveCriticalSection(&eee->peers_lock);
-            if (dest) {
-                memcpy(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE);
-                eee->cached_dst_sock = destination;
-                eee->cached_dst_time = now;
-                eee->cached_dst_is_peer = 1;
-                eee->cached_dst_valid = 1;
-            }
-        } else if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
-                   memcmp(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE) == 0)
-        {
-            /* Lock contended — use stale cache (better than blocking or dropping) */
-            dest = 1;
-            destination = eee->cached_dst_sock;
-            ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-        } else {
-            /* No cache and lock contended — relay via supernode (never block TAP thread) */
-            dest = 0;
-            destination = eee->supernode;
-            ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
-        }
-#else
-        /* Linux: single-threaded TAP, no contention */
+        /* Both platforms: lock only covers the destination lookup, never
+         * the send. Short critical section, no cache involved. */
         PEERS_LOCK(eee);
         dest = find_peer_destination(eee, dstMac, &destination);
         if (dest) { ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen; }
@@ -2466,14 +2423,6 @@ static int send_PACKET( n2n_edge_t * eee,
             destination = eee->supernode;
         }
         PEERS_UNLOCK(eee);
-        if (dest) {
-            memcpy(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE);
-            eee->cached_dst_sock = destination;
-            eee->cached_dst_time = now;
-            eee->cached_dst_is_peer = 1;
-            eee->cached_dst_valid = 1;
-        }
-#endif
     }
 
     traceEvent( TRACE_DEBUG, "send_PACKET to %s", sock_to_cstr( sockbuf, &destination ) );
@@ -2596,45 +2545,26 @@ static void send_packet2net(n2n_edge_t * eee,
     /* Once processed, send to destination in PACKET */
     tx_transop_idx = edge_choose_tx_transop( eee );
 
-    /* Use pre-cached header template if available for this peer and transform.
-     * The template has cmn + PACKET fields pre-encoded with dstMac as the
-     * only variable (padded to fixed position). */
-    if (eee->cached_hdr_valid &&
-        eee->cached_tx_transop == tx_transop_idx &&
-        memcmp(eee->cached_hdr_dst_mac, destMac, N2N_MAC_SIZE) == 0)
-    {
-        /* Fast path: reuse cached header + destination */
-        memcpy(pktbuf, eee->cached_pkt_hdr, eee->cached_hdr_len);
-        idx = eee->cached_hdr_len;
-    }
-    else
-    {
-        /* Slow path: build header from scratch, cache it */
-        memset( &cmn, 0, sizeof(cmn) );
-        cmn.ttl = N2N_DEFAULT_TTL;
-        cmn.pc = n2n_packet;
-        cmn.flags=0;
-        memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
+    /* Build the header from scratch on every packet.
+     * No shared cache: send_packet2net is called from both the TAP thread
+     * and the main loop thread, so a shared header template would be
+     * written/read without locking (data race). All state here is local. */
+    memset( &cmn, 0, sizeof(cmn) );
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_packet;
+    cmn.flags=0;
+    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
 
-        memset( &pkt, 0, sizeof(pkt) );
-        memcpy( pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
-        memcpy( pkt.dstMac, destMac, N2N_MAC_SIZE);
+    memset( &pkt, 0, sizeof(pkt) );
+    memcpy( pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
+    memcpy( pkt.dstMac, destMac, N2N_MAC_SIZE);
 
-        pkt.sock.family=0;
-        pkt.transform = eee->transop[tx_transop_idx].transform_id;
+    pkt.sock.family=0;
+    pkt.transform = eee->transop[tx_transop_idx].transform_id;
 
-        idx=0;
-        encode_PACKET( pktbuf, &idx, &cmn, &pkt );
+    idx=0;
+    encode_PACKET( pktbuf, &idx, &cmn, &pkt );
 
-        /* Cache the header template.
-         * Uses independent cached_hdr_dst_mac to avoid invalidating the
-         * destination address cache used by send_PACKET(). */
-        eee->cached_hdr_len = (uint16_t)idx;
-        memcpy(eee->cached_pkt_hdr, pktbuf, idx);
-        memcpy(eee->cached_hdr_dst_mac, destMac, N2N_MAC_SIZE);
-        eee->cached_tx_transop = tx_transop_idx;
-        eee->cached_hdr_valid = 1;
-    }
     traceEvent( TRACE_DEBUG, "encoded PACKET header of size=%u transform %u (idx=%u)",
                 (unsigned int)idx, (unsigned int)eee->transop[tx_transop_idx].transform_id, (unsigned int)tx_transop_idx );
 
@@ -3857,7 +3787,7 @@ process_n2n_packet:
                     /* During "f" sync: preserve existing P2P, skip address change detection */
                     if (eee->peer_sync_active && known->direct_seen != 0) {
                         PEERS_UNLOCK(eee);
-                        return;
+                        return 1;
                     }
                     int addr_changed = 0;
                     /* Principle 8+13: detect address change whenever P2P
@@ -3898,7 +3828,7 @@ process_n2n_packet:
                          * last_seen should only reflect actual peer communication
                          * (PACKET, REGISTER), not metadata from the supernode. */
                         PEERS_UNLOCK(eee);
-                        return;
+                        return 1;
                     }
 
                     struct peer_info *prev = NULL, *scan = eee->known_peers;
@@ -3950,10 +3880,10 @@ process_n2n_packet:
                                    (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                                    (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
                     }
-                    return;
+                    return 1;
                 }
                 pending = calloc(1, sizeof(struct peer_info));
-                if (!pending) { PEERS_UNLOCK(eee); return; }
+                if (!pending) { PEERS_UNLOCK(eee); return 1; }
                 memcpy(pending->mac_addr, pi.mac, N2N_MAC_SIZE);
                 pending->sock = pi.sockets[0];
                 pending->sockets[0] = pi.sockets[0];
@@ -3991,7 +3921,7 @@ process_n2n_packet:
                                (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                                (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
                 }
-                return;
+                return 1;
             }
 
             if (known) {
@@ -4010,7 +3940,7 @@ process_n2n_packet:
 
             if (!pending) {
                 pending = calloc(1, sizeof(struct peer_info));
-                if (!pending) { PEERS_UNLOCK(eee); return; }
+                if (!pending) { PEERS_UNLOCK(eee); return 1; }
                 memcpy(pending->mac_addr, pi.mac, N2N_MAC_SIZE);
                 peer_list_add(&eee->pending_peers, pending);
             }
@@ -6023,7 +5953,6 @@ static int run_loop(n2n_edge_t * eee )
             }
 
             if (removed > 0) {
-                eee->cached_dst_valid = 0;
                 traceEvent(TRACE_NORMAL, "Peer sync removed %u stale peer(s)", (unsigned int)removed);
             }
             eee->peer_sync_active = 0;
@@ -6052,11 +5981,6 @@ static int run_loop(n2n_edge_t * eee )
          * resume ping = unreachable" problem). The 1800s stuck-peer check in
          * check_punch_timeouts handles truly dead peers. */
         numPurged += purge_peer_list( &(eee->pending_peers), nowTime - 1800 );
-        /* Invalidate destination cache if any peer was purged — the cached
-         * peer may have been removed. Safe to set outside lock on Windows
-         * because TAP thread only reads this flag (0 = don't use cache). */
-        if (numPurged > 0)
-            eee->cached_dst_valid = 0;
         /* After purging, clean up bypass state for removed peers */
         if (bypass_has_peers(eee->bp) && bp_known_count > 0) {
             for (int _bki = 0; _bki < bp_known_count; _bki++) {

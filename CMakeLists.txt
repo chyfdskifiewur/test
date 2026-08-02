@@ -172,6 +172,12 @@ endif(DEFINED WIN32)
 
 if(WIN32)
   target_link_libraries(n2n_core bcrypt iphlpapi ws2_32)
+else()
+  # upnp.c uses pthread for async port-map cleanup on shutdown.
+  # Don't use find_package(Threads): it fails with cross-compilation
+  # toolchains (e.g. OpenWrt mipsel) that don't advertise pthreads to CMake.
+  # libdl is required on uClibc toolchains (libpthread depends on it).
+  target_link_libraries(n2n_core pthread dl)
 endif()
 
 # Dead code elimination
