@@ -454,10 +454,6 @@ struct n2n_edge
     size_t              p2p_tx_bytes;
     size_t              p2p_rx_bytes;
 
-    /* Keepalive data-flow detection: snapshot of p2p_rx_bytes at last check.
-     * Only P2P traffic counts — relay traffic does not suppress probes. */
-    size_t              last_p2p_rx;
-
 #ifdef _WIN32
     volatile int        keep_running;
     HANDLE              tun_thread_handle;

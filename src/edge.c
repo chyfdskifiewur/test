@@ -1545,11 +1545,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     }
 }
 
-#define KEEPALIVE_IDLE_SECONDS   12   /* send probe after this many seconds of silence */
-#define KEEPALIVE_RETRY_INTERVAL  4   /* seconds between retries */
+#define KEEPALIVE_IDLE_SECONDS   8    /* send probe after this many seconds of silence */
+#define KEEPALIVE_RETRY_INTERVAL  2   /* seconds between retries */
 #define KEEPALIVE_MAX_FAILS       3   /* fall back to relay after this many consecutive failures */
-#define KEEPALIVE_TOTAL_TIMEOUT   (KEEPALIVE_IDLE_SECONDS + KEEPALIVE_RETRY_INTERVAL * KEEPALIVE_MAX_FAILS)  /* 32s */
-#define FAST_P2P_FAIL_SECONDS    6    /* sec: if p2p peer not heard from, force relay immediately */
+#define KEEPALIVE_TOTAL_TIMEOUT   (KEEPALIVE_IDLE_SECONDS + KEEPALIVE_RETRY_INTERVAL * KEEPALIVE_MAX_FAILS)  /* 14s */
 #define P2P_EST_GRACE           1    /* sec: after P2P established, keep relay for this long */
 
 static void update_peer_address(n2n_edge_t * eee,
@@ -1584,19 +1583,13 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
         time_t idle = now - scan->last_seen;
 
         /* Only run keepalive for peers that have established P2P.
-         * For such peers: skip keepalive if edge-level data is flowing (n2n + bypass).
-         * Since bypass only operates after P2P is established, total byte
-         * throughput reliably indicates whether the connection is alive. */
+         * For such peers: skip keepalive if direct P2P traffic is flowing.
+         * direct_seen is updated by P2P packets only (handle_PACKET), so
+         * relay traffic and other peers' activity do NOT mask this peer's
+         * silence — each peer pair is kept alive independently. */
         if (scan->direct_seen > 0) {
-            /* Data flow guard: only RX from P2P (p2p_rx_bytes) counts as
-             * the peer being alive. Relay traffic (super_rx_bytes) does
-             * NOT count — we could be getting relayed packets while P2P
-             * is dead (e.g. WiFi switch), and we don't want to suppress
-             * keepalive probes. */
-            size_t cur_p2p_rx = eee->p2p_rx_bytes;
-            if (cur_p2p_rx > eee->last_p2p_rx) {
-                eee->last_p2p_rx = cur_p2p_rx;
-                scan->last_seen = now;
+            if ((now - scan->direct_seen) < KEEPALIVE_IDLE_SECONDS) {
+                /* Recent direct traffic: peer is alive, skip probe */
                 scan = next;
                 continue;
             }
@@ -1685,9 +1678,14 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                            macaddr_str(mac_tmp, scan->mac_addr), (long)idle);
             }
         } else {
-            /* Probe already sent: check if reply came back */
-            if ( scan->last_seen >= scan->last_probe_sent ) {
-                /* Got a reply: reset */
+            /* Probe already sent: check if a DIRECT reply came back.
+             * Only a P2P packet (which updates direct_seen) counts as the
+             * direct path being alive. Relay packets must NOT count —
+             * they update last_seen but come via the supernode, so they
+             * would falsely reset the probe while the direct path is
+             * actually dead (e.g. peer lost its NAT mapping). */
+            if ( scan->direct_seen >= scan->last_probe_sent ) {
+                /* Got a direct reply: reset */
                 scan->last_probe_sent = 0;
                 scan->keepalive_fails = 0;
             } else if ( (now - scan->last_probe_sent) >= KEEPALIVE_RETRY_INTERVAL ) {
@@ -2231,17 +2229,29 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
 
-        /* Close and re-open UDP sockets so NAT mapping is refreshed.
-         * This helps when the local address changed (e.g. WiFi switch)
-         * but the socket is still bound to the old IP. Only do this
-         * for non-privileged ports or zero (any port). */
-        if ( eee->local_port == 0 || eee->local_port > 1024 )
+        /* Only re-open the UDP sockets when the supernode is unreachable AND
+         * the local connection is completely dead (no P2P direct traffic and
+         * no supernode traffic for a while). Re-opening changes the local UDP
+         * port, which invalidates the NAT mapping of healthy P2P direct paths
+         * — a busy supernode (e.g. evening peak) missing registration ACKs is
+         * NOT a reason to disturb working direct links. But if everything is
+         * truly dead, a fresh socket may clear a stale local state and help
+         * reconnect to the supernode. */
         {
-            if (eee->udp_sock != -1) closesocket(eee->udp_sock);
-            if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
-            eee->udp_sock  = open_socket(eee->local_port, 1);
-            eee->udp_sock6 = open_socket6(eee->local_port, 1);
-            traceEvent(TRACE_NORMAL, "UDP sockets re-opened for fresh NAT mapping");
+            int local_alive = 0;
+            if (eee->last_p2p > 0 && (nowTime - eee->last_p2p) < 30)
+                local_alive = 1;   /* recent direct traffic: local net is fine */
+            else if (eee->last_sup > 0 && (nowTime - eee->last_sup) < 30)
+                local_alive = 1;   /* recent supernode reply: local net is fine */
+
+            if ( !local_alive && ( eee->local_port == 0 || eee->local_port > 1024 ) )
+            {
+                if (eee->udp_sock != -1) closesocket(eee->udp_sock);
+                if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
+                eee->udp_sock  = open_socket(eee->local_port, 1);
+                eee->udp_sock6 = open_socket6(eee->local_port, 1);
+                traceEvent(TRACE_NORMAL, "Supernode unreachable and no local traffic: re-opened UDP sockets");
+            }
         }
 
         /* Re-resolve supernode address when switching to a different supernode */
@@ -2314,22 +2324,11 @@ static int find_peer_destination(n2n_edge_t * eee,
                 break;
             }
 
-            /* If keepalive probe is pending and total timeout exceeded, fall back to relay */
-            if (scan->last_probe_sent > 0 && (now - scan->last_seen) > KEEPALIVE_TOTAL_TIMEOUT) {
+            /* If keepalive probe is pending and total timeout exceeded, fall back to relay.
+             * Uses direct_seen (P2P packets only) — relay packets must not extend the
+             * probe window, otherwise a dead direct path is never abandoned. */
+            if (scan->last_probe_sent > 0 && (now - scan->direct_seen) > KEEPALIVE_TOTAL_TIMEOUT) {
                 traceEvent(TRACE_DEBUG, "find_peer_destination: keepalive failed, using relay");
-                break;
-            }
-
-            /* Fast fail: if peer established P2P but hasn't been directly heard from for
-             * FAST_P2P_FAIL_SECONDS, the P2P path is likely dead (e.g. WiFi switch
-             * on peer side). Fall back to relay immediately instead of continuing
-             * to send packets into a dead path. This uses direct_seen (only updated
-             * by P2P packets) rather than last_seen (also updated by relay packets)
-             * to avoid P2P↔relay oscillation. */
-            if ((now - scan->direct_seen) > FAST_P2P_FAIL_SECONDS) {
-                traceEvent(TRACE_INFO, "find_peer_destination: %s P2P silent %lus, fast fail to relay",
-                           PEER_ID(mac_buf, scan),
-                           (unsigned long)(now - scan->direct_seen));
                 break;
             }
 
@@ -2408,6 +2407,7 @@ static int send_PACKET( n2n_edge_t * eee,
      * is a short list scan). Blocking is preferable to relaying: dropping a
      * packet to relay on lock contention would corrupt the P2P path. The
      * actual UDP send happens after the lock is released. */
+    int probing = 0;
     if (eee->use_ws) {
         dest = 0;
         destination = eee->supernode;
@@ -2417,8 +2417,18 @@ static int send_PACKET( n2n_edge_t * eee,
          * the send. Short critical section, no cache involved. */
         PEERS_LOCK(eee);
         dest = find_peer_destination(eee, dstMac, &destination);
-        if (dest) { ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen; }
-        else {
+        if (dest) {
+            ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
+            /* If keepalive is currently probing this peer (a PROBE was sent
+             * and no direct reply yet), send data over BOTH the direct path
+             * and the relay. This keeps the data flowing while the direct
+             * path is being verified — no packets lost during the probe
+             * window. The relay leg is dropped as soon as a direct reply
+             * clears last_probe_sent. */
+            struct peer_info *p = find_peer_by_mac(eee->known_peers, dstMac);
+            if (p && p->last_probe_sent > 0)
+                probing = 1;
+        } else {
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
             destination = eee->supernode;
         }
@@ -2427,7 +2437,21 @@ static int send_PACKET( n2n_edge_t * eee,
 
     traceEvent( TRACE_DEBUG, "send_PACKET to %s", sock_to_cstr( sockbuf, &destination ) );
 
-    if (!dest) {
+    if (dest) {
+        /* Direct path first */
+        sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
+        if (probing) {
+            /* Probe window: also relay via supernode so no data is lost
+             * while the direct path is being verified. */
+            if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
+                if (++eee->sn_relay_fails >= 3)
+                    eee->last_register_req = 0;
+            } else {
+                eee->sn_relay_fails = 0;
+            }
+            ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
+        }
+    } else {
         /* Relay via supernode: WS mode uses ws_send, otherwise UDP */
         if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
             /* Consecutive failures trigger supernode re-registration */
@@ -2436,8 +2460,6 @@ static int send_PACKET( n2n_edge_t * eee,
         } else {
             eee->sn_relay_fails = 0;
         }
-    } else {
-        sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
     }
 
     /* If routing via supernode for a unicast peer, re-register with supernode
