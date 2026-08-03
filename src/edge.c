@@ -61,6 +61,7 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
+#define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -2142,6 +2143,10 @@ static void update_peer_address(n2n_edge_t * eee,
     if (is_empty_ip_address(peer)) return;  /* Not to be registered. */
     if (0 == memcmp(mac, broadcast_mac, N2N_MAC_SIZE)) return;  /* Not to be registered. */
 
+    /* The peer's address is changing: invalidate any cached destination
+     * so the next packet re-resolves it instead of using the stale one. */
+    eee->cached_dst_valid = 0;
+
 
     while(scan != NULL)
     {
@@ -2316,7 +2321,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 /* @return 1 if destination is a peer, 0 if destination is supernode */
 static int find_peer_destination(n2n_edge_t * eee,
                                  n2n_mac_t mac_address,
-                                 n2n_sock_t * destination)
+                                 n2n_sock_t * destination,
+                                 struct peer_info ** out_peer /* may be NULL */)
 {
     const struct peer_info *scan = eee->known_peers;
     macstr_t mac_buf;
@@ -2375,6 +2381,7 @@ static int find_peer_destination(n2n_edge_t * eee,
             }
             
             retval=1;
+            if (out_peer) *out_peer = (struct peer_info *)scan;
             break;
         }
         scan = scan->next;
@@ -2383,6 +2390,7 @@ static int find_peer_destination(n2n_edge_t * eee,
     if ( 0 == retval )
     {
         memcpy(destination, &(eee->supernode), sizeof(n2n_sock_t));
+        if (out_peer) *out_peer = NULL;
     }
 
     traceEvent(TRACE_DEBUG, "find_peer_address (%s) -> %s",
@@ -2443,24 +2451,39 @@ static int send_PACKET( n2n_edge_t * eee,
         destination = eee->supernode;
         ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
     } else {
-        /* Both platforms: lock only covers the destination lookup, never
-         * the send. Short critical section, no cache involved. */
+        /* Destination cache: a hit avoids the peer-table scan on every
+         * packet. The cache is keyed by dstMac and has a short TTL so a
+         * NAT-mapped / restarted peer is re-resolved quickly. All reads
+         * and writes happen under PEERS_LOCK, keeping it race-free on
+         * Windows (TAP thread + main loop) and a no-op on Linux (single
+         * thread). */
         PEERS_LOCK(eee);
-        dest = find_peer_destination(eee, dstMac, &destination);
-        if (dest) {
+        struct peer_info *dst_peer = NULL;
+        if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
+            memcmp(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE) == 0 &&
+            (now - eee->cached_dst_time) < CACHE_DST_TTL)
+        {
+            dest = 1;
+            destination = eee->cached_dst_sock;
             ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-            /* If keepalive is currently probing this peer (a PROBE was sent
-             * and no direct reply yet), send data over BOTH the direct path
-             * and the relay. This keeps the data flowing while the direct
-             * path is being verified — no packets lost during the probe
-             * window. The relay leg is dropped as soon as a direct reply
-             * clears last_probe_sent. */
-            struct peer_info *p = find_peer_by_mac(eee->known_peers, dstMac);
-            if (p && p->last_probe_sent > 0)
+            dst_peer = find_peer_by_mac(eee->known_peers, dstMac);
+            if (dst_peer && dst_peer->last_probe_sent > 0)
                 probing = 1;
         } else {
-            ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
-            destination = eee->supernode;
+            dest = find_peer_destination(eee, dstMac, &destination, &dst_peer);
+            if (dest) {
+                ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
+                if (dst_peer && dst_peer->last_probe_sent > 0)
+                    probing = 1;
+                memcpy(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE);
+                eee->cached_dst_sock = destination;
+                eee->cached_dst_time = now;
+                eee->cached_dst_is_peer = 1;
+                eee->cached_dst_valid = 1;
+            } else {
+                ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
+                destination = eee->supernode;
+            }
         }
         PEERS_UNLOCK(eee);
     }
@@ -3902,12 +3925,14 @@ process_n2n_packet:
                             if (known->sock.family != AF_INET ||
                                 sock_equal(&known->sock, &pi.sockets[0]) != 0) {
                                 addr_changed = 1;
+                                eee->cached_dst_valid = 0;
                             }
                         }
                         if (!addr_changed && pi.sock6.family == AF_INET6) {
                             if (known->sock6.family != AF_INET6 ||
                                 sock_equal(&known->sock6, &pi.sock6) != 0) {
                                 addr_changed = 1;
+                                eee->cached_dst_valid = 0;
                             }
                         }
                     }

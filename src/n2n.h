@@ -402,6 +402,16 @@ struct n2n_edge
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     size_t              tx_transop_idx;
 
+    /* Destination cache for the P2P send path (see edge.c send_PACKET).
+     * A cache hit avoids the per-packet peer-table scan. All access is
+     * inside PEERS_LOCK, so it is safe on Windows (TAP thread + main
+     * loop) and a no-op lock on Linux (single thread). */
+    uint8_t             cached_dst_valid;
+    uint8_t             cached_dst_is_peer;
+    n2n_mac_t           cached_dst_mac;
+    n2n_sock_t          cached_dst_sock;
+    time_t              cached_dst_time;
+
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
 #ifdef _WIN32
