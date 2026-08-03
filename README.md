@@ -8,7 +8,7 @@ n2n6 is forked from [mxre's n2n](https://github.com/mxre/n2n), adding STUN hole-
 
 ### Quick Start
 
-**Supernode server (support for IPv4/IPv6 dual-stack is required)**
+**Supernode server**
 
 ```bash
 supernode -l 1234

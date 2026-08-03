@@ -8,7 +8,7 @@ n2n6 是由 [mxre's n2n](https://github.com/mxre/n2n) 发展而来的，增加�
 
 ### 快速开始
 
-**Supernode 服务器（要求支持ipv4和ipv6双栈）**
+**Supernode 服务器**
 
 ```bash
 supernode -l 1234
