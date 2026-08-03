@@ -174,6 +174,8 @@ struct n2n_REGISTER_SUPER
     n2n_auth_t          auth;           /* Authentication scheme and tokens */
     uint16_t            aflags;         /* additional flags (N2N_AFLAGS_*) */
     n2n_sock_t          local_sock;     /* LAN address for same-NAT direct connect */
+    n2n_sock_t          own_ipv6;       /* global IPv6 (GUA) reported by the edge, valid
+                                           only when N2N_AFLAGS_IPV6_SOCKET set */
 };
 
 typedef struct n2n_REGISTER_SUPER n2n_REGISTER_SUPER_t;

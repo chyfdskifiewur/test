@@ -509,8 +509,18 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     
     int has_ipv4 = (eee->udp_sock != -1);
     int has_ipv6 = 0;
+    memset(&eee->own_ipv6, 0, sizeof(n2n_sock_t));
     
     if (eee->udp_sock6 != -1) {
+        /* Actual listening port of udp_sock6: needed as own_ipv6 port so
+         * peers can be told where our IPv6 UDP socket is running. Use
+         * getsockname since the port may be auto-assigned when local_port=0. */
+        uint16_t v6_port = (uint16_t)local_port;
+        struct sockaddr_in6 lsock;
+        socklen_t llen = sizeof(lsock);
+        if (getsockname(eee->udp_sock6, (struct sockaddr*)&lsock, &llen) == 0 && llen >= sizeof(lsock))
+            v6_port = ntohs(lsock.sin6_port);
+
         struct ifaddrs *ifap = NULL;
 #ifndef _WIN32
         if (getifaddrs(&ifap) == 0) {
@@ -518,10 +528,17 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
             for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
                 if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET6) continue;
                 struct sockaddr_in6 *s6 = (struct sockaddr_in6*)ifa->ifa_addr;
-                if (!IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
-                    !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
-                    has_ipv6 = 1;
-                    break;
+                if (IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) ||
+                    IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+                    continue;
+                has_ipv6 = 1;
+                /* Only a globally-routable GUA (2000::/3) is worth reporting:
+                 * fd00 (ULA) / site-local would mislead peers into useless probe
+                 * attempts. Pick the first GUA as our reportable IPv6. */
+                if (!eee->own_ipv6.family && (s6->sin6_addr.s6_addr[0] & 0xE0) == 0x20) {
+                    eee->own_ipv6.family = AF_INET6;
+                    eee->own_ipv6.port = v6_port;
+                    memcpy(eee->own_ipv6.addr.v6, &s6->sin6_addr, IPV6_SIZE);
                 }
             }
             freeifaddrs(ifap);
@@ -535,11 +552,15 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
                 IP_ADAPTER_UNICAST_ADDRESS *ua;
                 for (ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
                     struct sockaddr_in6 *s6 = (struct sockaddr_in6*)ua->Address.lpSockaddr;
-                    if (s6->sin6_family == AF_INET6 &&
-                        !IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
-                        !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
-                        has_ipv6 = 1;
-                        break;
+                    if (s6->sin6_family != AF_INET6 ||
+                        IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) ||
+                        IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+                        continue;
+                    has_ipv6 = 1;
+                    if (!eee->own_ipv6.family && (s6->sin6_addr.s6_addr[0] & 0xE0) == 0x20) {
+                        eee->own_ipv6.family = AF_INET6;
+                        eee->own_ipv6.port = v6_port;
+                        memcpy(eee->own_ipv6.addr.v6, &s6->sin6_addr, 16);
                     }
                 }
                 if (has_ipv6) break;
@@ -1208,6 +1229,15 @@ static void send_register_super( n2n_edge_t * eee,
     if (eee->local_sock_ena) {
         reg.aflags    |= N2N_AFLAGS_LOCAL_SOCKET;
         reg.local_sock = eee->local_sock;
+    }
+
+    /* Report our routable global IPv6 (GUA) to the supernode. When the
+     * supernode is IPv4-only it cannot observe our IPv6 itself, so it
+     * relies on this reported address to hand to peers for IPv6 hole-
+     * punching. Only reported if we actually have a GUA. */
+    if (eee->own_ipv6.family == AF_INET6) {
+        reg.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        reg.own_ipv6 = eee->own_ipv6;
     }
 
     /* Request full peer list push when "f" sync is in progress */
@@ -3400,6 +3430,51 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
            (struct sockaddr*) &sender_sock, i);
 }
 
+/** Attempt LAN / IPv4 direct registration for a peer described by a PEER_INFO.
+ *
+ * This is the shared LAN/IPv4 flow used when there is no IPv6 candidate
+ * (original behaviour) AND when there is an IPv6 candidate from an IPv4-only
+ * supernode (edge-reported address). When \p ipv6_candidate is non-NULL and
+ * valid, the IPv6 address is additionally tried as a parallel candidate — the
+ * LAN/IPv4 flow itself is left completely unchanged so that an IPv4-only
+ * supernode never degrades LAN / IPv4 direct connectivity.
+ *
+ * Must be called with PEERS_LOCK held. */
+static void try_peer_lan_ipv4( n2n_edge_t * eee,
+                               uint16_t aflags,
+                               const n2n_sock_t * pub_sock,
+                               const n2n_sock_t * lan_sock,
+                               struct peer_info * pending,
+                               const n2n_sock_t * ipv6_candidate )
+{
+    int same_lan = (aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                    lan_sock->family != 0 && lan_sock->port != 0 &&
+                    eee->my_public_sock.family == AF_INET &&
+                    pub_sock->family == AF_INET &&
+                    memcmp(eee->my_public_sock.addr.v4, pub_sock->addr.v4, IPV4_SIZE) == 0;
+    pending->p2p_is_lan = same_lan ? 1 : 0;
+
+    if (same_lan) {
+        n2n_sock_t lan = *lan_sock;
+        n2n_sock_str_t lanbuf;
+        lan.port = pub_sock->port;
+        traceEvent(TRACE_INFO, "Same public IP - trying LAN direct: %s",
+                   sock_to_cstr(lanbuf, &lan));
+        try_send_register_lan(eee, 1, pending->mac_addr, pub_sock, &lan);
+    } else {
+        try_send_register(eee, 1, pending->mac_addr, &pending->sock);
+        if (pending->num_sockets >= 2 && pending->sockets[1].family != 0 && pending->sockets[1].port != 0) {
+            n2n_sock_t lan = pending->sockets[1];
+            lan.port = pending->sockets[0].port;
+            send_register(eee, &lan);
+        }
+    }
+
+    /* Reported IPv6 as a parallel candidate only (never replaces LAN/IPv4). */
+    if (ipv6_candidate && ipv6_candidate->family == AF_INET6 && eee->udp_sock6 != -1)
+        try_send_register(eee, 1, pending->mac_addr, ipv6_candidate);
+}
+
 /** Read a datagram from the main UDP socket to the internet.
  *  @return 1 if a packet was read (caller should try to read more),
  *          0 if no more data is available (queue drained). */
@@ -3989,29 +4064,24 @@ process_n2n_packet:
             pending->psp_logged = 0;
             pending->p2p_logged = 0;
 
-            if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
+            if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
+                eee->sn_ipv6_support) {
+                /* Dual-stack supernode: sock6 was learned via real IPv6
+                 * registration. Keep the original behaviour exactly — try
+                 * the IPv6 address directly. */
                 try_send_register(eee, 1, pi.mac, &pending->sock6);
+            } else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
+                /* IPv4-only supernode: sock6 is an edge-reported address
+                 * (extra way to obtain an IPv6 address). It must NOT change
+                 * the LAN / IPv4 direct flow — run the exact same LAN/IPv4
+                 * logic, using the reported IPv6 only as an ADDITIONAL
+                 * parallel candidate. */
+                try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
+                                  pending, &pending->sock6);
             } else {
-                int same_lan = (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
-                                pi.sockets[1].family != 0 && pi.sockets[1].port != 0 &&
-                                eee->my_public_sock.family == AF_INET &&
-                                pi.sockets[0].family == AF_INET &&
-                                memcmp(eee->my_public_sock.addr.v4, pi.sockets[0].addr.v4, IPV4_SIZE) == 0;
-                pending->p2p_is_lan = same_lan ? 1 : 0;
-                if (same_lan) {
-                    n2n_sock_t lan_sock = pi.sockets[1];
-                    lan_sock.port = pi.sockets[0].port;
-                    traceEvent(TRACE_INFO, "Same public IP - trying LAN direct: %s",
-                               sock_to_cstr(sockbuf1, &lan_sock));
-                    try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
-                } else {
-                    try_send_register(eee, 1, pi.mac, &pending->sock);
-                    if (pending->num_sockets >= 2 && pending->sockets[1].family != 0 && pending->sockets[1].port != 0) {
-                        n2n_sock_t lan_sock = pending->sockets[1];
-                        lan_sock.port = pending->sockets[0].port;
-                        send_register(eee, &lan_sock);
-                    }
-                }
+                /* No IPv6 candidate: unchanged LAN / IPv4 direct flow. */
+                try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
+                                  pending, NULL);
             }
 
             PEERS_UNLOCK(eee);

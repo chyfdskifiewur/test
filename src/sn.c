@@ -559,6 +559,7 @@ static int update_edge( n2n_sn_t * sss,
                         const n2n_sock_t * sender_sock,
                         const n2n_sock_t * local_sock,
                         uint8_t local_sock_ena,
+                        const n2n_sock_t * report_ipv6, /* edge-reported GUA or NULL */
                         time_t now,
                         const char * version,
                         const char * os_name,
@@ -670,6 +671,7 @@ static int update_edge( n2n_sn_t * sss,
                         const n2n_sock_t * sender_sock,
                         const n2n_sock_t * local_sock,
                         uint8_t local_sock_ena,
+                        const n2n_sock_t * report_ipv6, /* edge-reported GUA or NULL */
                         time_t now,
                         const char * version,
                         const char * os_name,
@@ -815,6 +817,14 @@ static int update_edge( n2n_sn_t * sss,
             memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
             /* sock6 remains 0 from calloc */
         }
+
+        /* Edge-reported global IPv6 (GUA). An IPv4-only supernode cannot
+         * observe our IPv6, so it uses this address to hand to peers for
+         * IPv6 hole-punching. A dual-stack supernode observes sock6 itself
+         * (more authoritative, it is the NAT egress), so only fall back to
+         * the reported address when no IPv6 was observed. */
+        if (scan->sock6.family != AF_INET6 && report_ipv6 && report_ipv6->family == AF_INET6)
+            memcpy(&(scan->sock6), report_ipv6, sizeof(n2n_sock_t));
 
         /* Check if edge is in same LAN as supernode:
          * local_sock IP == sender_sock IP and both are private */
@@ -972,6 +982,10 @@ static int update_edge( n2n_sn_t * sss,
             } else {
                 memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
                 /* Don't clear sock6 - it may have IPv6 from earlier registration */
+                /* IPv4-only registration: use edge-reported GUA as sock6
+                 * when we still have no observed IPv6 (see note at top). */
+                if (scan->sock6.family != AF_INET6 && report_ipv6 && report_ipv6->family == AF_INET6)
+                    memcpy(&(scan->sock6), report_ipv6, sizeof(n2n_sock_t));
             }
 
             /* Check if edge is in same LAN as supernode */
@@ -2168,6 +2182,8 @@ static int process_udp( n2n_sn_t * sss,
 
         int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
                      local_sock_ptr, local_sock_ena,
+                     ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) && reg.own_ipv6.family == AF_INET6)
+                         ? &reg.own_ipv6 : NULL,
                      now, NULL, NULL, use_request_ip, use_requested_ip );
 
         /* Set assigned IP in ACK */

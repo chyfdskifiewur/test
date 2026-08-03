@@ -422,6 +422,10 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
+    n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
+                                           reported to supernode for IPv6 hole-punching
+                                           when the supernode is IPv4-only. family==0 if none. */
+
     n2n_sock_t          local_sock;
     int                 local_sock_ena;
 

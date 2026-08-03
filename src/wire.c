@@ -332,7 +332,19 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
         retval += encode_uint8( base, idx, 0 );
     }
     retval += encode_uint16( base, idx, reg->aflags );
-    retval += encode_uint16( base, idx, 0 );
+    retval += encode_uint16( base, idx, reg->auth.scheme );
+    retval += encode_uint16( base, idx, reg->auth.toksize );
+    /* Consume auth token data if present */
+    if ( reg->auth.toksize > 0 ) {
+        uint16_t toksize = reg->auth.toksize;
+        if (toksize > N2N_AUTH_TOKEN_SIZE) toksize = N2N_AUTH_TOKEN_SIZE;
+        retval += encode_buf( base, idx, reg->auth.token, toksize );
+    }
+    /* Report our global IPv6 (GUA) so an IPv4-only supernode can still
+     * hand it to peers for IPv6 hole-punching. Beaconed only when the
+     * edge actually has a routable GUA. */
+    if ( reg->aflags & N2N_AFLAGS_IPV6_SOCKET )
+        retval += encode_sock( base, idx, &reg->own_ipv6 );
     return retval;
 }
 
@@ -373,6 +385,13 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
             retval += decode_buf( reg->auth.token, toksize, base, rem, idx );
         }
     }
+
+    /* Report GUA carried at the tail (marked by N2N_AFLAGS_IPV6_SOCKET).
+     * Only read if the flag is set AND enough bytes remain, so an old
+     * edge's packet (flag clear) stays fully backward compatible, and a
+     * truncated/foreign packet is not over-read. */
+    if ( (reg->aflags & N2N_AFLAGS_IPV6_SOCKET) && *rem >= sizeof(n2n_sock_t) )
+        retval += decode_sock( &reg->own_ipv6, base, rem, idx );
 
     return retval;
 }
