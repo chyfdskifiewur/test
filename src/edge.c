@@ -2807,6 +2807,13 @@ static int handle_PACKET( n2n_edge_t * eee,
                 peer_list_add(&eee->pending_peers, p);
                 traceEvent(TRACE_DEBUG, "handle_PACKET: saved relayed peer %s",
                            macaddr_str(mac_buf, pkt->srcMac));
+                /* A supernode that never pushes PEER_INFO (e.g. cnn2n)
+                 * still relays PACKETs whose pkt.sock carries the real
+                 * source address. Kick off hole punching immediately so
+                 * we try to go direct instead of staying on relay. */
+                if (orig_sender->family == AF_INET) {
+                    try_send_register(eee, 1, pkt->srcMac, orig_sender);
+                }
             }
         }
     } else if (!from_supernode) {
@@ -4146,9 +4153,12 @@ process_n2n_packet:
                                                assigned_ip_str, eee->device.ip_prefixlen);
                             }
                         } else if (!default_ip_assignment && ra.dev_addr.net_addr == 0) {
-                            traceEvent(TRACE_ERROR, "%s is already in use, exiting",
+                            /* Static IP requested via -a, but the supernode did not
+                             * echo any IP back (e.g. third-party supernodes like
+                             * cnn2n keep dev_addr zero for a valid static request).
+                             * Keep our own configured static IP instead of exiting. */
+                            traceEvent(TRACE_DEBUG, "Supernode did not echo an IP for static address; keeping %s",
                                        inet_ntoa(*(struct in_addr*)&eee->device.ip_addr));
-                            exit(1);
                         }
 
                         /* Set sn_caps before daemonize so the log line is visible on terminal */
