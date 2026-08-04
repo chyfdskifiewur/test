@@ -361,20 +361,31 @@ int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
 
     uint8_t   *keystream8 = (uint8_t*)ctx->keystream32;
     size_t    tmp_len     = in_len;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_AMD64) || defined(_M_IX86)
+    /* x86: hardware unaligned access is safe, XOR directly */
+    size_t    i, j;
+#else
     uint32_t  aligned_in[16], aligned_out[16];
     size_t    i, j;
+#endif
 
     cc20_init_context(ctx, iv);
 
     while(in_len >= 64) {
         cc20_block_next(ctx);
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_AMD64) || defined(_M_IX86)
+        /* x86: direct XOR, no memcpy roundtrip */
+        for(i = 0; i < 16; i++)
+            ((uint32_t*)out)[i] = ((uint32_t*)in)[i] ^ ctx->keystream32[i];
+#else
         /* Copy input to aligned buffer, XOR, copy back.
          * Avoids unaligned uint32_t* access which is slow on MIPS. */
         memcpy(aligned_in, in, 64);
         for(i = 0; i < 16; i++)
             aligned_out[i] = aligned_in[i] ^ ctx->keystream32[i];
         memcpy(out, aligned_out, 64);
+#endif
 
         in  += 64;
         out += 64;

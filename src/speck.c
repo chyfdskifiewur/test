@@ -610,7 +610,22 @@ int speck_ctr (unsigned char *out, const unsigned char *in, unsigned long long i
     return 0;
   }
 
-  /* Load nonce via memcpy to avoid unaligned u64* access on MIPS */
+  #if defined(__x86_64__) || defined(__i386__) || defined(_M_AMD64) || defined(_M_IX86)
+  /* x86: hardware unaligned access is safe, use direct pointer casts */
+  nonce[0] = htole64(((u64*)n)[0]);
+  nonce[1] = htole64(((u64*)n)[1]);
+
+  t = 0;
+  while (inlen >= 16) {
+    x = nonce[1]; y = nonce[0]; nonce[0]++;
+    speck_encrypt (&x, &y, ctx);
+    ((u64*)out)[1+t] = htole64(x ^ ((u64*)in)[1+t]);
+    ((u64*)out)[0+t] = htole64(y ^ ((u64*)in)[0+t]);
+    t += 2;
+    inlen -= 16;
+  }
+#else
+  /* Load nonce via memcpy to avoid unaligned u64* access on MIPS/ARM */
   memcpy(&nonce[0], n,     8);
   memcpy(&nonce[1], n + 8, 8);
   nonce[0] = htole64(nonce[0]);
@@ -632,6 +647,7 @@ int speck_ctr (unsigned char *out, const unsigned char *in, unsigned long long i
     t += 2;
     inlen -= 16;
   }
+#endif
   if (inlen > 0) {
     x = nonce[1]; y = nonce[0];
     speck_encrypt (&x, &y, ctx);
