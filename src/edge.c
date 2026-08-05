@@ -2519,7 +2519,6 @@ static int send_PACKET( n2n_edge_t * eee,
      * and query peer's latest address - triggers full reconnect like a restart. */
     if ( !dest && !is_multi_broadcast(dstMac) )
     {
-        time_t now = n2n_now();
         PEERS_LOCK(eee);
         struct peer_info *p = find_peer_by_mac(eee->pending_peers, dstMac);
         if ( !p ) p = find_peer_by_mac(eee->known_peers, dstMac);
@@ -2804,94 +2803,7 @@ static int handle_PACKET( n2n_edge_t * eee,
         eee->last_p2p=now;
     }
 
-    /* Update the sender in peer table entry */
-    PEERS_LOCK(eee);
-    struct peer_info *scan = find_peer_by_mac(eee->known_peers, pkt->srcMac);
-    if (NULL == scan) {
-        scan = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
-    }
-    if (NULL == scan) {
-        if (from_supernode) {
-            /* Unknown peer sent via relay. Save its address so we can
-             * contact it via relay in return. */
-            macstr_t mac_buf;
-            struct peer_info *p = (struct peer_info *)calloc(1, sizeof(struct peer_info));
-            if (p) {
-                memcpy(p->mac_addr, pkt->srcMac, N2N_MAC_SIZE);
-                if (orig_sender->family == AF_INET6) {
-                    p->sock6 = *orig_sender;
-                    p->sock = *orig_sender;
-                } else {
-                    p->sock = *orig_sender;
-                }
-                p->sockets[0] = *orig_sender;
-                p->num_sockets = 1;
-                p->last_seen = now;
-                peer_list_add(&eee->pending_peers, p);
-                traceEvent(TRACE_DEBUG, "handle_PACKET: saved relayed peer %s",
-                           macaddr_str(mac_buf, pkt->srcMac));
-                /* A supernode that never pushes PEER_INFO (e.g. cnn2n)
-                 * still relays PACKETs whose pkt.sock carries the real
-                 * source address. Kick off hole punching immediately so
-                 * we try to go direct instead of staying on relay. */
-                if (orig_sender->family == AF_INET) {
-                    try_send_register(eee, 1, pkt->srcMac, orig_sender);
-                }
-            }
-        }
-    } else if (!from_supernode) {
-        /* P2P packet: refresh direct communication timestamp */
-        scan->direct_seen = now;
-        scan->last_probe_sent = 0;
-        scan->keepalive_fails = 0;
-        
-        /* Check which protocol this peer is using */
-        int peer_uses_ipv4 = (scan->sock.family == AF_INET);
-        int peer_uses_ipv6 = (scan->sock6.family == AF_INET6);
-        int packet_is_ipv4 = (orig_sender->family == AF_INET);
-        
-        /* Only update if packet matches peer's active protocol */
-        if ((peer_uses_ipv4 && packet_is_ipv4) || (peer_uses_ipv6 && !packet_is_ipv4)) {
-            n2n_sock_t *expected_sock = peer_uses_ipv4 ? &scan->sock : &scan->sock6;
-            if (0 != sock_equal(expected_sock, orig_sender)) {
-                /* Principle 13: peer's address changed during P2P communication.
-                 * Update address and send REGISTER to confirm our reverse path. */
-                update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
-                send_register(eee, orig_sender);
-                send_register(eee, &(eee->supernode));
-            } else {
-                scan->last_seen = now;
-            }
-        } else {
-            /* Packet from different protocol family - just update last_seen */
-            scan->last_seen = now;
-        }
-    } else {
-        /* Relayed packet from known peer.
-         * If P2P has never been established (direct_seen == 0), the
-         * peer's address in pkt->sock (from supernode) may be more
-         * current — overwrite and trigger re-punch (Principle 13).
-         *
-         * If P2P has been established (direct_seen > 0), the stored
-         * address is already correct. A relay packet is not evidence
-         * of address change — overwriting would destroy the correct
-         * address and cause unnecessary breakage (especially for LAN
-         * peers where pkt->sock is the public address, not LAN addr).
-         * Keepalive handles true P2P failure detection and recovery. */
-        if (scan->direct_seen == 0 && !is_empty_ip_address(&pkt->sock)) {
-            n2n_sock_t *active_sock = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
-            if (sock_equal(active_sock, &pkt->sock) != 0) {
-                macstr_t mb;
-                traceEvent(TRACE_INFO, "Peer %s addr from SN, updating",
-                           macaddr_str(mb, pkt->srcMac));
-                *active_sock = pkt->sock;
-            }
-        }
-        scan->last_seen = now;
-    }
-    PEERS_UNLOCK(eee);
-
-    /* Handle transform. */
+    /* Handle transform first — only do peer management if decode succeeds. */
     {
         uint8_t decodebuf[N2N_PKT_BUF_SIZE];
         size_t eth_size;
@@ -2914,27 +2826,84 @@ static int handle_PACKET( n2n_edge_t * eee,
                                                          payload, psize, pkt->srcMac );
             ++(eee->transop[rx_transop_idx].rx_cnt); /* stats */
 
-            /* Write ethernet packet to tap device. */
+            /* Update sender in peer table + extract assigned IP — single lookup. */
+            PEERS_LOCK(eee);
+            struct peer_info *scan = find_peer_by_mac(eee->known_peers, pkt->srcMac);
+            if (NULL == scan) {
+                scan = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
+            }
+            if (NULL == scan) {
+                if (from_supernode) {
+                    macstr_t mac_buf;
+                    struct peer_info *p = (struct peer_info *)calloc(1, sizeof(struct peer_info));
+                    if (p) {
+                        memcpy(p->mac_addr, pkt->srcMac, N2N_MAC_SIZE);
+                        if (orig_sender->family == AF_INET6) {
+                            p->sock6 = *orig_sender;
+                            p->sock = *orig_sender;
+                        } else {
+                            p->sock = *orig_sender;
+                        }
+                        p->sockets[0] = *orig_sender;
+                        p->num_sockets = 1;
+                        p->last_seen = now;
+                        peer_list_add(&eee->pending_peers, p);
+                        traceEvent(TRACE_DEBUG, "handle_PACKET: saved relayed peer %s",
+                                   macaddr_str(mac_buf, pkt->srcMac));
+                        if (orig_sender->family == AF_INET) {
+                            try_send_register(eee, 1, pkt->srcMac, orig_sender);
+                        }
+                        scan = p; /* reuse for assigned_ip extraction below */
+                    }
+                }
+            } else if (!from_supernode) {
+                scan->direct_seen = now;
+                scan->last_probe_sent = 0;
+                scan->keepalive_fails = 0;
+                
+                int peer_uses_ipv4 = (scan->sock.family == AF_INET);
+                int peer_uses_ipv6 = (scan->sock6.family == AF_INET6);
+                int packet_is_ipv4 = (orig_sender->family == AF_INET);
+                
+                if ((peer_uses_ipv4 && packet_is_ipv4) || (peer_uses_ipv6 && !packet_is_ipv4)) {
+                    n2n_sock_t *expected_sock = peer_uses_ipv4 ? &scan->sock : &scan->sock6;
+                    if (0 != sock_equal(expected_sock, orig_sender)) {
+                        update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
+                        send_register(eee, orig_sender);
+                        send_register(eee, &(eee->supernode));
+                    } else {
+                        scan->last_seen = now;
+                    }
+                } else {
+                    scan->last_seen = now;
+                }
+            } else {
+                if (scan->direct_seen == 0 && !is_empty_ip_address(&pkt->sock)) {
+                    n2n_sock_t *active_sock = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
+                    if (sock_equal(active_sock, &pkt->sock) != 0) {
+                        macstr_t mb;
+                        traceEvent(TRACE_INFO, "Peer %s addr from SN, updating",
+                                   macaddr_str(mb, pkt->srcMac));
+                        *active_sock = pkt->sock;
+                    }
+                }
+                scan->last_seen = now;
+            }
 
-            /* Extract sender's virtual IP from first packet if not yet known */
-            if ( eth_size >= 34 ) {
+            /* Extract sender's virtual IP — reuse 'scan' from above, no second lookup. */
+            if ( scan && scan->assigned_ip == 0 && eth_size >= 34 ) {
                 uint16_t ethertype = (eth_payload[12] << 8) | eth_payload[13];
                 uint32_t src_ip = 0;
-                struct peer_info *sp;
                 if ( ethertype == 0x0800 && eth_size >= 34 ) {
                     memcpy(&src_ip, eth_payload + 26, 4);
                 } else if ( ethertype == 0x0806 && eth_size >= 42 ) {
                     memcpy(&src_ip, eth_payload + 28, 4);
                 }
                 if ( src_ip != 0 ) {
-                    PEERS_LOCK(eee);
-                    sp = find_peer_by_mac(eee->known_peers, pkt->srcMac);
-                    if ( !sp ) sp = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
-                    if ( sp && sp->assigned_ip == 0 )
-                        sp->assigned_ip = ntohl(src_ip);
-                    PEERS_UNLOCK(eee);
+                    scan->assigned_ip = ntohl(src_ip);
                 }
             }
+            PEERS_UNLOCK(eee);
 
             /* Check for bypass probe frames before writing to TAP */
             if (eee->bp && eth_size >= 14) {
@@ -4046,7 +4015,7 @@ process_n2n_packet:
                     uint32_t target_ip = htonl(pi.assigned_ip);
                     memcpy(probe + 38, &target_ip, 4);
                     send_packet2net(eee, probe, sizeof(probe));
-                    traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
+                        traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
                                (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                                (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
                 }

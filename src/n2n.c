@@ -217,28 +217,10 @@ SOCKET open_socket_unix(const char* path, mode_t access) {
 int traceLevel = 2 /* NORMAL */;
 bool useSyslog = false, syslog_opened = false, useSystemd = false;
 
-/* Get wall-clock time via direct syscall, bypassing musl's broken time().
- * musl 64-bit time_t + 32-bit kernel syscall causes timespec layout mismatch,
- * so time(NULL)/gettimeofday()/clock_gettime() all return garbage on 32-bit ARM.
- * SYS_clock_gettime32 uses 32-bit timespec; native syscall uses native timespec. */
+/* Get wall-clock time via time(NULL) — fast vDSO call on Linux, no syscall overhead. */
 static time_t n2n_wall_time(void) {
 #ifndef _WIN32
-    long ret = -1;
-#if defined(SYS_clock_gettime32)
-    /* 32-bit time syscall: must use 32-bit timespec to match */
-    struct { int32_t tv_sec; int32_t tv_nsec; } ts32;
-    ret = syscall(SYS_clock_gettime32, CLOCK_REALTIME, &ts32);
-    if (ret == 0) return (time_t)ts32.tv_sec;
-#elif defined(SYS_clock_gettime)
-    /* Native syscall: use native struct timespec (64-bit on 64-bit OS) */
-    struct timespec ts;
-    ret = syscall(SYS_clock_gettime, CLOCK_REALTIME, &ts);
-    if (ret == 0) return ts.tv_sec;
-#elif defined(__NR_clock_gettime)
-    struct timespec ts;
-    ret = syscall(__NR_clock_gettime, CLOCK_REALTIME, &ts);
-    if (ret == 0) return ts.tv_sec;
-#endif
+    return time(NULL);
 #endif
     return time(NULL);
 }
@@ -278,7 +260,7 @@ time_t n2n_now(void) {
 }
 
 #define N2N_TRACE_DATESIZE 32
-void traceEvent(int eventTraceLevel, char* file, int line, char * format, ...) {
+void _traceEvent(int eventTraceLevel, char* file, int line, char * format, ...) {
     va_list va_ap;
 
     if(eventTraceLevel <= traceLevel) {
