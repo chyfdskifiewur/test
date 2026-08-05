@@ -217,11 +217,9 @@ SOCKET open_socket_unix(const char* path, mode_t access) {
 int traceLevel = 2 /* NORMAL */;
 bool useSyslog = false, syslog_opened = false, useSystemd = false;
 
-/* Get wall-clock time via time(NULL) — fast vDSO call on Linux, no syscall overhead. */
+/* Get wall-clock time via time(NULL) — fast vDSO call on Linux,
+ * equivalent fast call on Windows. No syscall overhead on either platform. */
 static time_t n2n_wall_time(void) {
-#ifndef _WIN32
-    return time(NULL);
-#endif
     return time(NULL);
 }
 

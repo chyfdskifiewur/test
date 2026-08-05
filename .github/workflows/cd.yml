@@ -156,10 +156,11 @@ jobs:
           cmake .. `
             -G "NMake Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_FLAGS_RELEASE="/MT /O2 /DWIN32 /D_WIN32_WINNT=0x0601" `
-            -DCMAKE_EXE_LINKER_FLAGS="/SUBSYSTEM:CONSOLE,6.01 /MACHINE:${{ matrix.ARCH }}" `
+            -DCMAKE_C_FLAGS_RELEASE="/MT /O2 /Gy /Gw /DWIN32 /D_WIN32_WINNT=0x0601" `
+            -DCMAKE_EXE_LINKER_FLAGS="/SUBSYSTEM:CONSOLE,6.01 /MACHINE:${{ matrix.ARCH }} /OPT:REF /OPT:ICF" `
             -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded"
           nmake
+          if ($LASTEXITCODE -ne 0) { Write-Host "nmake failed with exit code $LASTEXITCODE"; exit $LASTEXITCODE }
           .\edge.exe -h || true
           .\supernode.exe -h || true
 
@@ -173,10 +174,11 @@ jobs:
           cmake .. `
             -G "NMake Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_FLAGS_RELEASE="/MD /O2 /DWIN32 /D_WIN32_WINNT=0x0601" `
-            -DCMAKE_EXE_LINKER_FLAGS="/SUBSYSTEM:CONSOLE,6.01 /MACHINE:${{ matrix.ARCH }}" `
+            -DCMAKE_C_FLAGS_RELEASE="/MD /O2 /Gy /Gw /DWIN32 /D_WIN32_WINNT=0x0601" `
+            -DCMAKE_EXE_LINKER_FLAGS="/SUBSYSTEM:CONSOLE,6.01 /MACHINE:${{ matrix.ARCH }} /OPT:REF /OPT:ICF" `
             -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreadedDLL"
           nmake
+          if ($LASTEXITCODE -ne 0) { Write-Host "nmake failed with exit code $LASTEXITCODE"; exit $LASTEXITCODE }
           .\edge.exe -h || true
           .\supernode.exe -h || true
 
@@ -195,14 +197,33 @@ jobs:
       - name: Linux build
         if: runner.os == 'Linux'
         run: |
+          set -e
           LINKDIR="build"
           rm -rf "$LINKDIR"
           mkdir -p "$LINKDIR" && cd "$LINKDIR"
-          EXTRA=""
-          [ "${{ endsWith(matrix.TARGET, '_static') }}" = "true" ] && EXTRA="-static -static-libgcc"
+          if [ "${{ endsWith(matrix.TARGET, '_static') }}" = "true" ]; then
+            EXTRA="-static -static-libgcc"
+          else
+            EXTRA=""
+          fi
+          # Architecture-specific optimization flags:
+          # - aarch64: NEON always available; -DSPECK_ARM_NEON enables Speck NEON path
+          # - armv7 Cortex-A (musleabihf): -DSPECK_ARM_NEON -mfpu=neon
+          # - armv7 Cortex-M (musleabi): NO NEON (architecture lacks it)
+          # - x86_64/arm/mips legacy: no SIMD flags
+          #   NOTE: -msse4.2 was tested on J1800 Docker and caused ~12% throughput
+          #   regression (140→124 Mbps). Do NOT add -msse4.2 for x86_64 without
+          #   re-validating on the target hardware.
+          ARCH_FLAGS=""
+          case "${{ matrix.TARGET }}" in
+            aarch64-*)       ARCH_FLAGS="-DSPECK_ARM_NEON" ;;
+            armv7-linux-musleabihf*) ARCH_FLAGS="-DSPECK_ARM_NEON -mfpu=neon" ;;
+          esac
+          echo "Target=${{ matrix.TARGET }} ARCH_FLAGS=$ARCH_FLAGS EXTRA=$EXTRA"
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-O3 -fno-strict-aliasing" \
+            -DCMAKE_C_FLAGS="-O2 -fno-strict-aliasing $ARCH_FLAGS" \
+            -DCMAKE_C_FLAGS_RELEASE="-DNDEBUG" \
             -DCMAKE_EXE_LINKER_FLAGS="$EXTRA" \
             -DCMAKE_C_COMPILER=${CC}
           make -j$(nproc)
@@ -215,12 +236,16 @@ jobs:
       - name: macOS build
         if: runner.os == 'macOS'
         run: |
+          set -e
           rm -rf build
           mkdir -p build && cd build
+          # -arch x86_64: force x64 output on arm64 runners (macos-latest is arm64)
+          # NOTE: -msse4.2 intentionally omitted — caused regression on J1800 Docker
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-O2 -ffunction-sections -fdata-sections" \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-dead_strip"
+            -DCMAKE_C_FLAGS="-O2 -arch x86_64 -ffunction-sections -fdata-sections" \
+            -DCMAKE_C_FLAGS_RELEASE="-DNDEBUG" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-dead_strip -arch x86_64"
           make -j$(sysctl -n hw.logicalcpu)
           ./edge -h || true
           ls -la

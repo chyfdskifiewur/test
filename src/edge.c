@@ -49,9 +49,13 @@
 #include <resolv.h>
 #endif
 
-/* reallocarray compatibility for older glibc versions */
+/* reallocarray compatibility for older glibc versions.
+ * Guard with #ifndef reallocarray so this never clashes with the
+ * definition in win32/n2n_win32.h on Windows builds (MSVC C4005). */
 #ifndef HAVE_REALLOCARRAY
+#ifndef reallocarray
 #define reallocarray(p, n, s) realloc((p), (n) * (s))
+#endif
 #endif
 
 #define SOCKET_TIMEOUT_INTERVAL_SECS    1    /* sec */
@@ -4015,9 +4019,9 @@ process_n2n_packet:
                     uint32_t target_ip = htonl(pi.assigned_ip);
                     memcpy(probe + 38, &target_ip, 4);
                     send_packet2net(eee, probe, sizeof(probe));
-                        traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
-                               (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
-                               (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
+                    traceEvent(TRACE_INFO, "Gaming: ARP probe sent to %u.%u.%u.%u",
+                              (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
+                              (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF);
                 }
                 return 1;
             }

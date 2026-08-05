@@ -2549,13 +2549,15 @@ int main( int argc, char * const argv[] )
     sss.mgmt_sock = open_socket(sss.mgmt_port, 0 /* bind LOOPBACK */ );
     if ( -1 == sss.mgmt_sock )
     {
-        traceEvent( TRACE_ERROR, "Failed to open management socket. %s", 
+        /* Resolve error string outside the traceEvent() macro — MSVC rejects
+         * preprocessor directives inside macro arguments (C99 6.10.3p11). */
 #ifdef _WIN32
-                    "socket error"
+        const char *mgmt_err = "socket error";
 #else
-                    strerror(errno)
+        const char *mgmt_err = strerror(errno);
 #endif
-                    );
+        traceEvent( TRACE_ERROR, "Failed to open management socket. %s",
+                    mgmt_err );
         exit(-2);
     }
     traceEvent( TRACE_NORMAL, "supernode is listening on UDP %u (management)", sss.mgmt_port );

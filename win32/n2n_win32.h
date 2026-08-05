@@ -66,7 +66,9 @@ typedef long ssize_t;
 #endif
 #endif /* #ifdef _MSC_VER */
 
+#ifndef reallocarray
 #define reallocarray(p, n, s) realloc((p), ((n)*(s)))
+#endif
 
 #define access _access
 #define R_OK 4
