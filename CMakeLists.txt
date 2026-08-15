@@ -149,6 +149,14 @@ add_library(n2n_core STATIC
 )
 set_property(TARGET n2n_core PROPERTY C_STANDARD 99)
 
+# minilzo's _lzo_config_check() self-test (union type-punning + integer-cast
+# pointer reads) is mis-optimized under -O2/-O3 strict aliasing on modern
+# GCC/Clang, making lzo_init() wrongly return LZO_E_ERROR and edge abort at
+# startup ("LZO compression error"). Relax aliasing for this file only.
+if(NOT WIN32 AND (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang"))
+    set_source_files_properties(src/minilzo.c PROPERTIES COMPILE_OPTIONS -fno-strict-aliasing)
+endif()
+
 # Build edge executable
 add_executable(edge src/edge.c ${EDGE_RESOURCE})
 set_property(TARGET edge PROPERTY C_STANDARD 99)
