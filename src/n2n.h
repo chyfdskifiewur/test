@@ -398,6 +398,7 @@ struct n2n_edge
     int                 use_ws;
     ws_conn_t           ws_conn;
     time_t              ws_last_reconnect;
+    time_t              ws_last_ping;   /* last app-level WS ping (keep proxy/NAT alive) */
 
     tuntap_dev          device;
     int                 dyn_ip_mode;

@@ -66,11 +66,13 @@ typedef struct {
 void    ws_init(ws_conn_t *c);
 
 /* Client (edge): establish TCP connection and send WS Upgrade handshake, synchronously read 101 response.
- *   host: hostname or IP string (e.g. "1.2.3.4" or "example.com")
+ *   host: hostname or IP string used for the TCP connect (e.g. "1.2.3.4" or "example.com")
+ *   host_header: hostname placed in the HTTP Host header (e.g. the original -l domain when
+ *                connecting through a CDN / reverse proxy). NULL falls back to host.
  *   port: port (host byte order)
  * On success state=WS_OPEN, data phase uses blocking socket (read scheduled by select).
  * Connection timeout 5s, handshake timeout 5s. Returns 0 success, <0 failure. */
-int     ws_connect(ws_conn_t *c, const char *host, uint16_t port);
+int     ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t port);
 
 /* Server (sn): accept a new connection and complete WS handshake (synchronous).
  *   listen_fd: TCP listening socket that has been set to listen

@@ -272,8 +272,8 @@ void ws_close(ws_conn_t *c) {
 
 
 /* ---- Client handshake: compute and send Upgrade, read and verify 101 ---- */
-static int ws_client_handshake(SOCKET fd, const char *host, uint16_t port,
-                               ws_conn_t *c) {
+static int ws_client_handshake(SOCKET fd, const char *host, const char *host_header,
+                               uint16_t port, ws_conn_t *c) {
     uint8_t key[16];
     char keyb64[32];
     char req[512];
@@ -281,19 +281,38 @@ static int ws_client_handshake(SOCKET fd, const char *host, uint16_t port,
     char hbuf[1024];
     int hl;
     char *eoh;
+    /* Host header value: prefer the caller-supplied domain (needed for CDN /
+     * reverse proxy virtual-host routing), fall back to the connect host.
+     * Strip IPv6 brackets "[v6]" -> "v6" for a clean Host. */
+    char hh[160];
+    const char *hdr_host = host_header ? host_header : host;
+    if (hdr_host[0] == '\0') hdr_host = host;  /* empty header: fall back */
+    if (strncmp(hdr_host, "[", 1) == 0) {
+        size_t hl2 = strlen(hdr_host);
+        if (hl2 > 2 && hdr_host[hl2 - 1] == ']') {
+            snprintf(hh, sizeof(hh), "%.*s", (int)(hl2 - 2), hdr_host + 1);
+            hdr_host = hh;
+        }
+    }
+    /* Omit port for default 80 (ws) / 443 (wss) so the Host stays clean. */
+    char portstr[8];
+    if (port == 80 || port == 443)
+        portstr[0] = '\0';
+    else
+        snprintf(portstr, sizeof(portstr), ":%u", (unsigned)port);
 
     random_bytes(NULL, key, 16);
     b64encode(key, 16, keyb64);
 
     rl = snprintf(req, sizeof(req),
         "GET / HTTP/1.1\r\n"
-        "Host: %s:%u\r\n"
+        "Host: %s%s\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n",
-        host, (unsigned)port, keyb64);
+        hdr_host, portstr, keyb64);
 
     if (rl <= 0 || (size_t)rl >= sizeof(req)) return -1;
     if (ws_send_all(fd, (const uint8_t*)req, (size_t)rl) < 0) return -1;
@@ -385,7 +404,7 @@ static int ws_server_handshake(SOCKET fd, ws_conn_t *c) {
 }
 
 
-int ws_connect(ws_conn_t *c, const char *host, uint16_t port) {
+int ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t port) {
     struct addrinfo hints, *res = NULL, *rp;
     char ps[16];
     SOCKET fd = -1;
@@ -456,7 +475,7 @@ int ws_connect(ws_conn_t *c, const char *host, uint16_t port) {
     ws_set_block(fd);
     ws_set_timeo(fd, 5);
 
-    if (ws_client_handshake(fd, host, port, c) < 0) {
+    if (ws_client_handshake(fd, host, host_header, port, c) < 0) {
         traceEvent(TRACE_WARNING, "ws_connect: WS handshake to %s:%u failed", host, (unsigned)port);
         ws_close(c);
         return -1;
@@ -702,12 +721,15 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                 ws_close(c);
                 return -1;
             } else if (opcode == 0x9) {
-                /* ping -> pong */
+                /* ping -> pong (application heartbeat; counts as activity so
+                 * the connection is not idle-timed out) */
+                c->last_seen = time(NULL);
                 ws_send_control(c, 0xA, payload, payload_len);
                 ws_consume(c, need);
                 continue;  /* Continue to decode next frame */
             } else if (opcode == 0xA) {
-                /* pong */
+                /* pong (reply to our heartbeat: peer alive) */
+                c->last_seen = time(NULL);
                 ws_consume(c, need);
                 continue;
             } else {

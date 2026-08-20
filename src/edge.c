@@ -5702,10 +5702,24 @@ static void edge_ws_connect(n2n_edge_t *eee) {
     if (eee->ws_conn.state == WS_OPEN) return;
     if (n2n_now() - eee->ws_last_reconnect < 5 && eee->ws_last_reconnect != 0) return;
 
+    /* Host header: use the original -l host string (domain), not the resolved
+     * IP, so CDN / reverse proxies can route by virtual host. Strip any
+     * trailing ":port" and IPv6 brackets like supernode2addr does. */
+    char host_header[N2N_EDGE_SN_HOST_SIZE];
+    const char *raw = eee->sn_ip_array[eee->sn_idx];
+    if (raw[0] == '[') {
+        /* [v6]:port */
+        snprintf(host_header, sizeof(host_header), "%.*s",
+                 (int)(strcspn(raw + 1, "]")), raw + 1);
+    } else {
+        size_t n = strcspn(raw, ":");
+        snprintf(host_header, sizeof(host_header), "%.*s", (int)n, raw);
+    }
+
     ws_close(&eee->ws_conn);
     ws_init(&eee->ws_conn);
     eee->ws_conn.is_client = 1; /* edge side: send with mask */
-    if (ws_connect(&eee->ws_conn, ws_host, ws_port) == 0) {
+    if (ws_connect(&eee->ws_conn, ws_host, host_header, ws_port) == 0) {
         traceEvent(TRACE_NORMAL, "WS connected to %s:%u", ws_host, ws_port);
     } else {
         traceEvent(TRACE_INFO, "WS connect to %s:%u failed (will retry)", ws_host, ws_port);
@@ -5913,9 +5927,20 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
         }
-        /* WS mode: rely on TCP keepalive (set in ws_set_keepalive) to detect dead connections,
-         * no application-level ping needed. */
+        /* WS heartbeat: application-level ping every 30s. TCP keepalive
+         * segments are swallowed by CDN / reverse proxies, so without this
+         * an idle WS connection would be dropped by the proxy long before
+         * the 120s stale check below notices. pong is auto-replied by the
+         * peer's ws_recv (SN side replies automatically). */
         if (eee->use_ws && eee->ws_conn.state == WS_OPEN) {
+            if (nowTime - eee->ws_last_ping >= 30) {
+                eee->ws_last_ping = nowTime;
+                if (ws_ping(&eee->ws_conn) < 0) {
+                    traceEvent(TRACE_WARNING, "WS ping failed, closing");
+                    ws_close(&eee->ws_conn);
+                    eee->ws_last_reconnect = nowTime;
+                }
+            }
             /* check for stale connection via last_seen (updated on data recv only) */
             if (nowTime - eee->ws_conn.last_seen > 120) {
                 traceEvent(TRACE_WARNING, "WS connection stale, closing");
