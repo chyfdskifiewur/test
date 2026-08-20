@@ -75,7 +75,6 @@ struct community_stats {
 
     /* Total bytes since stats start */
     uint64_t total_bytes;
-    time_t   stats_start_time;
     time_t   last_active;
 
     /* Rate limiting */
@@ -100,8 +99,8 @@ struct rate_limit_rule {
 };
 
 /* Find or create community stats entry.
- * If newly created and rules != NULL, applies rate limit rules immediately
- * so per-packet apply_rules_to_stats() calls are not needed. */
+ * Rate limit rules are applied lazily on first use (see try_forward /
+ * try_broadcast) so per-packet rule lookups are avoided for the steady state. */
 static struct community_stats * get_community_stats(
         struct community_stats **head,
         const n2n_community_t community,
@@ -116,7 +115,6 @@ static struct community_stats * get_community_stats(
     s = (struct community_stats*)calloc(1, sizeof(struct community_stats));
     if (!s) return NULL;
     memcpy(s->community_name, community, sizeof(n2n_community_t));
-    s->stats_start_time = now;
     s->last_day    = now;
     s->last_minute = now;
     s->last_second = now;
@@ -125,6 +123,25 @@ static struct community_stats * get_community_stats(
     s->next = *head;
     *head = s;
     return s;
+}
+
+/* Advance expired 30-day buckets: roll the day window forward to now,
+ * evicting any whole days that have elapsed since last_day. */
+static void advance_30d_buckets(struct community_stats *s, time_t now)
+{
+    if (s->last_day > 0 && now - s->last_day >= 86400) {
+        int ddiff = (now - s->last_day) / 86400;
+        if (ddiff > COMM_STATS_DAYS) ddiff = COMM_STATS_DAYS;
+        while (ddiff-- > 0) {
+            s->day_idx = (s->day_idx + 1) % COMM_STATS_DAYS;
+            if (s->total_30d >= s->bytes_30d[s->day_idx])
+                s->total_30d -= s->bytes_30d[s->day_idx];
+            else
+                s->total_30d = 0;
+            s->bytes_30d[s->day_idx] = 0;
+        }
+        s->last_day = now;
+    }
 }
 
 /* Update traffic counters for a community */
@@ -173,12 +190,7 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
     s->last_24h_bytes += bytes;
 
     /* 30-day rolling window */
-    if (now - s->last_day >= 86400) {
-        s->last_day = now;
-        s->day_idx  = (s->day_idx + 1) % COMM_STATS_DAYS;
-        s->total_30d -= s->bytes_30d[s->day_idx];
-        s->bytes_30d[s->day_idx] = 0;
-    }
+    advance_30d_buckets(s, now);
     s->bytes_30d[s->day_idx] += bytes;
     s->total_30d += bytes;
 }
@@ -424,6 +436,12 @@ static void save_community_stats(n2n_sn_t *sss, time_t now)
                 s->min_idx, (int64_t)s->last_minute);
         for (int i = 0; i < COMM_STATS_DAYS; i++)
             fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
+        /* 24h 分钟桶：每行 240 个值，共 6 行。
+         * 必须持久化，否则重启后滑动窗口无法衰减，24h 限速会永久命中。 */
+        for (int i = 0, c = 0; i < COMM_STATS_MINUTES; i++) {
+            fprintf(fp, "%" PRIu64 "%c", s->bytes_1440[i], c == 239 ? '\n' : ' ');
+            if (++c == 240) c = 0;
+        }
         s = s->next;
     }
     fclose(fp);
@@ -450,7 +468,7 @@ static void load_community_stats(n2n_sn_t *sss)
                    &day_idx, &last_day, &min_idx, &last_minute) != 9)
             continue;
 
-        char bline[512];
+        char bline[2048];
         if (!fgets(bline, sizeof(bline), fp)) break;
 
         struct community_stats *s = get_community_stats(&sss->comm_stats,
@@ -476,20 +494,24 @@ static void load_community_stats(n2n_sn_t *sss)
             p++;
         }
 
-        /* Advance expired 30d buckets */
-        if (s->last_day > 0 && now - s->last_day >= 86400) {
-            int ddiff = (now - s->last_day) / 86400;
-            if (ddiff > COMM_STATS_DAYS) ddiff = COMM_STATS_DAYS;
-            while (ddiff-- > 0) {
-                s->day_idx = (s->day_idx + 1) % COMM_STATS_DAYS;
-                if (s->total_30d >= s->bytes_30d[s->day_idx])
-                    s->total_30d -= s->bytes_30d[s->day_idx];
-                else
-                    s->total_30d = 0;
-                s->bytes_30d[s->day_idx] = 0;
+        /* 24h 分钟桶：每行 240 个值，共 6 行 */
+        int got = 0;
+        char mline[6144];
+        while (got < COMM_STATS_MINUTES) {
+            if (!fgets(mline, sizeof(mline), fp)) break;
+            p = mline;
+            while (got < COMM_STATS_MINUTES) {
+                uint64_t v = 0;
+                if (sscanf(p, "%" SCNu64, &v) != 1) break;
+                s->bytes_1440[got++] = v;
+                p = strchr(p, ' ');
+                if (!p) break;
+                p++;
             }
-            s->last_day = now;
         }
+
+        /* Advance expired 30d buckets */
+        advance_30d_buckets(s, now);
     }
     fclose(fp);
     traceEvent(TRACE_NORMAL, "Traffic stats loaded from %s", path);
@@ -518,26 +540,15 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
         }
 
         /* Advance expired 30d buckets */
-        if (s->last_day > 0 && now - s->last_day >= 86400) {
-            int ddiff = (now - s->last_day) / 86400;
-            if (ddiff > COMM_STATS_DAYS) ddiff = COMM_STATS_DAYS;
-            while (ddiff-- > 0) {
-                s->day_idx = (s->day_idx + 1) % COMM_STATS_DAYS;
-                if (s->total_30d >= s->bytes_30d[s->day_idx])
-                    s->total_30d -= s->bytes_30d[s->day_idx];
-                else
-                    s->total_30d = 0;
-                s->bytes_30d[s->day_idx] = 0;
-            }
-            s->last_day = now;
-            /* If 30d traffic is now zero, remove */
-            if (s->total_30d == 0) {
-                *pp = s->next;
-                struct mac_ip_entry *e = s->mac_ip_map;
-                while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
-                free(s);
-                continue;
-            }
+        advance_30d_buckets(s, now);
+
+        /* If 30d traffic is now zero, remove */
+        if (s->total_30d == 0) {
+            *pp = s->next;
+            struct mac_ip_entry *e = s->mac_ip_map;
+            while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
+            free(s);
+            continue;
         }
 
         pp = &s->next;
@@ -1322,7 +1333,6 @@ static int process_mgmt( n2n_sn_t * sss,
     struct peer_info *list;
 #define MAX_COMMUNITIES 256
     n2n_community_t communities[MAX_COMMUNITIES];
-    struct peer_info *community_edges[MAX_COMMUNITIES];
     int num_communities = 0;
     uint32_t num_edges = 0;
 
@@ -1376,7 +1386,6 @@ static int process_mgmt( n2n_sn_t * sss,
         }
         if (!found && num_communities < MAX_COMMUNITIES) {
             memcpy(communities[num_communities], list->community_name, sizeof(n2n_community_t));
-            community_edges[num_communities] = NULL; /* unused now */
             num_communities++;
         } else if (!found) {
             traceEvent(TRACE_WARNING,
@@ -1402,10 +1411,11 @@ static int process_mgmt( n2n_sn_t * sss,
                 /* Zero out KB/s if no traffic in last COMM_STATS_SECONDS */
                 if (now - cs->last_second >= COMM_STATS_SECONDS)
                     kbps = 0.0;
-                /* Show the traffic line when there is current throughput OR a
-                  * visible 30-day total (>= 0.1 GB). A community with no
-                  * throughput and no meaningful history would display
-                  * "0.0  0.0  0.0" — hide it and show the name only. */
+                /* Online community: show the traffic line whenever there is
+                 * current throughput or a visible 30-day total (>= 0.1 GB).
+                 * An online group with history must always display its
+                 * numbers so the total traffic still adds up, even when it
+                 * is idle right now (0 KB/s, 0 24h). */
                 if (kbps > 0.0 || gb_30d >= 0.1) {
                     const char *arrow = (kbps >= 0.1) ? "--->" : "    ";
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
@@ -1512,7 +1522,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Offline communities: in comm_stats but no current edges */
     /* Show individually if has recent 24h traffic, else aggregate into Older Offline */
-    double older_kbps = 0.0, older_24h = 0.0, older_30d = 0.0;
+    double older_30d = 0.0;
     if (sss->traffic_stats_enabled) {
         struct community_stats *cs = sss->comm_stats;
         while (cs) {
@@ -1530,18 +1540,17 @@ static int process_mgmt( n2n_sn_t * sss,
                 if (now - cs->last_second >= COMM_STATS_SECONDS)
                     kbps = 0.0;
 
-                /* Show individually only when there is current throughput or a
-                  * visible 30-day total (>= 0.1 GB). Otherwise it would print
-                  * "0.0  0.0  0.0" — aggregate silently instead. */
-                if (kbps > 0.0 || gb30d >= 0.1) {
+                /* Show individually only when there is current throughput or
+                  * recent 24h traffic. Otherwise (24h idle) aggregate into
+                  * Offline_over_24h. */
+                if (kbps > 0.0 || gb24h >= 0.01) {
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                        "%-57.16s       %-7.1f  %-7.1f  %-10.1f\n",
                                        cs->community_name, kbps, gb24h, gb30d);
                     r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
                     if (r <= 0) return -1;
                 } else if (gb30d > 0.0) {
-                     /* Tiny/no recent traffic: aggregate into Older Offline */
-                     older_kbps += kbps;
+                     /* No recent traffic: aggregate into Older Offline */
                      older_30d  += gb30d;
                  }
             } else {
@@ -1555,7 +1564,7 @@ static int process_mgmt( n2n_sn_t * sss,
     }
 
     /* Older Offline: aggregated stats for offline groups with no 24h traffic */
-    if (sss->traffic_stats_enabled && (older_30d > 0.001 || older_24h > 0.001)) {
+    if (sss->traffic_stats_enabled && older_30d > 0.001) {
         ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                    "%-57.16s       %-7.1f  %-7.1f  %-10.1f\n",
                                    "Offline_over_24h", 0.0, 0.0, older_30d);
@@ -1648,16 +1657,30 @@ static int try_broadcast( n2n_sn_t * sss,
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
 
-    /* Rate limiting check for broadcast */
+    /* Rate limiting check for broadcast.
+     * Server-perspective accounting: a broadcast is sent once per member,
+     * so the actual egress bytes are pktsize * member_count. Check against
+     * the full amount up front so one broadcast cannot bypass the limit by
+     * only consuming a single packet's quota. */
     if (sss->traffic_stats_enabled) {
         cs = get_community_stats(&sss->comm_stats,
                                                       cmn->community, now);
         if (cs) {
             if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
                 apply_rules_to_stats(cs, sss->rate_rules);
-            if (!check_rate_limit(cs, pktsize, now)) {
-                traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s",
-                           cmn->community);
+            /* Count members (excluding sender) for up-front limit check */
+            size_t member_count = 0;
+            struct peer_info *m = sss->edges;
+            while (m) {
+                if (memcmp(m->community_name, cmn->community, sizeof(n2n_community_t)) == 0
+                    && memcmp(srcMac, m->mac_addr, sizeof(n2n_mac_t)) != 0)
+                    member_count++;
+                m = m->next;
+            }
+            if (!check_rate_limit(cs, pktsize * (member_count ? member_count : 1), now)) {
+                traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s "
+                           "(%u members)",
+                           cmn->community, (unsigned)member_count);
                 return 0;
             }
         }

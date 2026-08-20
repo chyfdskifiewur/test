@@ -617,7 +617,10 @@ ssize_t ws_send(ws_conn_t *c, const void *payload, size_t len) {
     }
 
     c->last_seen = time(NULL);
-    return (ssize_t)(hlen + len);
+    /* Return payload length (not including frame header), matching the
+     * semantics of UDP sendto so callers can compare against the original
+     * packet size (e.g. SN traffic accounting in try_forward/try_broadcast). */
+    return (ssize_t)len;
 }
 
 
