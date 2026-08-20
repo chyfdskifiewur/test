@@ -144,6 +144,37 @@ static void advance_30d_buckets(struct community_stats *s, time_t now)
     }
 }
 
+/* Advance expired 24-hour minute buckets: roll the sliding window forward to
+ * now so last_24h_bytes decays even while a community is idle or throttled.
+ * This is what prevents the rate limit from dead-locking a community that has
+ * exhausted its 24h quota: without traffic there is no update_community_traffic
+ * call, so only periodic advancement (purge/load) can shrink last_24h_bytes. */
+static void advance_24h_buckets(struct community_stats *s, time_t now)
+{
+    if (s->last_minute > now) {
+        /* Clock went backwards: rebuild from buckets */
+        uint64_t total = 0;
+        for (int k = 0; k < COMM_STATS_MINUTES; k++) total += s->bytes_1440[k];
+        s->last_24h_bytes = total;
+        s->last_minute = now;
+        return;
+    }
+    if (now - s->last_minute < 60)
+        return;
+
+    int mdiff = (int)((now - s->last_minute) / 60);
+    if (mdiff > COMM_STATS_MINUTES) mdiff = COMM_STATS_MINUTES;
+    while (mdiff-- > 0) {
+        s->min_idx = (s->min_idx + 1) % COMM_STATS_MINUTES;
+        if (s->last_24h_bytes >= s->bytes_1440[s->min_idx])
+            s->last_24h_bytes -= s->bytes_1440[s->min_idx];
+        else
+            s->last_24h_bytes = 0;
+        s->bytes_1440[s->min_idx] = 0;
+    }
+    s->last_minute = now;
+}
+
 /* Update traffic counters for a community */
 static void update_community_traffic(struct community_stats *s, size_t bytes, time_t now)
 {
@@ -169,23 +200,8 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
     }
     s->recent_seconds[s->recent_idx] += bytes;
 
-    /* 24h sliding window - guard against time jumps */
-    if (s->last_minute > now || now - s->last_minute > 7200) {
-        /* Time jump: recalculate from buckets */
-        uint64_t total = 0;
-        for (int k = 0; k < COMM_STATS_MINUTES; k++) total += s->bytes_1440[k];
-        s->last_24h_bytes = total;
-        s->last_minute = now;
-    } else if (now - s->last_minute >= 60) {
-        int mdiff = (now - s->last_minute) / 60;
-        if (mdiff > COMM_STATS_MINUTES) mdiff = COMM_STATS_MINUTES;
-        while (mdiff-- > 0) {
-            s->min_idx = (s->min_idx + 1) % COMM_STATS_MINUTES;
-            s->last_24h_bytes -= s->bytes_1440[s->min_idx];
-            s->bytes_1440[s->min_idx] = 0;
-        }
-        s->last_minute = now;
-    }
+    /* 24h sliding window */
+    advance_24h_buckets(s, now);
     s->bytes_1440[s->min_idx] += bytes;
     s->last_24h_bytes += bytes;
 
@@ -206,16 +222,20 @@ static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
     if (s->max_24h_bytes > 0 && total_24h >= s->max_24h_bytes) {
         if (s->rate_limit_bps == 0)
             return 0; /* hard block */
-        /* throttle via token bucket */
+        /* Throttle via token bucket. The bucket must always be able to hold
+         * at least one full packet, otherwise a limit set below the packet
+         * size would dead-lock the community (no packet could ever pass). */
+        uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
+        uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
+        if (max_tokens < min_bucket) max_tokens = min_bucket;
         if (s->last_token_refill == 0) {
             s->last_token_refill = now;
-            s->tokens = (uint64_t)(s->rate_limit_bps * RATE_LIMIT_FACTOR);
+            s->tokens = max_tokens; /* start full so a single packet can pass */
         }
         time_t elapsed = now - s->last_token_refill;
         if (elapsed > 0) {
             s->last_token_refill = now;
             s->tokens += (uint64_t)(elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
-            uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
             if (s->tokens > max_tokens) s->tokens = max_tokens;
         }
         if (s->tokens < bytes) return 0;
@@ -510,7 +530,9 @@ static void load_community_stats(n2n_sn_t *sss)
             }
         }
 
-        /* Advance expired 30d buckets */
+        /* After restore, roll 24h/30d windows forward to current time so
+         * quotas decay correctly after a downtime or long throttle. */
+        advance_24h_buckets(s, now);
         advance_30d_buckets(s, now);
     }
     fclose(fp);
@@ -539,7 +561,12 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             continue;
         }
 
-        /* Advance expired 30d buckets */
+        /* Refresh rate limit rules and advance expired 24h/30d buckets so
+         * quotas decay while idle/throttled. Periodic refresh makes config
+         * changes take effect for communities that never go idle long enough
+         * to hit the lazy first-use path. */
+        apply_rules_to_stats(s, sss->rate_rules);
+        advance_24h_buckets(s, now);
         advance_30d_buckets(s, now);
 
         /* If 30d traffic is now zero, remove */
@@ -1247,7 +1274,18 @@ static int try_forward( n2n_sn_t * sss,
     n2n_sock_str_t      sockbuf;
     time_t              now = time(NULL);
 
-    /* Rate limiting check */
+    scan = find_peer_by_mac( sss->edges, dstMac );
+
+    /* Check the destination exists first: packets to unknown MACs are dropped
+     * without touching traffic stats / rate limit, so flooding a random MAC
+     * cannot consume a community's quota. */
+    if ( NULL == scan )
+    {
+        traceEvent( TRACE_DEBUG, "try_forward unknown MAC" );
+        return 0;
+    }
+
+    /* Rate limiting check (after destination lookup) */
     if (sss->traffic_stats_enabled) {
         cs = get_community_stats(&sss->comm_stats,
                                                       cmn->community, now);
@@ -1262,53 +1300,42 @@ static int try_forward( n2n_sn_t * sss,
         }
     }
 
-    scan = find_peer_by_mac( sss->edges, dstMac );
+    ssize_t data_sent_len;
+    n2n_sock_t *primary = (scan->connect_family == AF_INET6 && scan->sock6.family == AF_INET6)
+                          ? &scan->sock6 : &scan->sock;
 
-    if ( NULL != scan )
+    /* WS edge goes via ws_send, otherwise UDP primary/fallback address families */
+    data_sent_len = sn_send_to_peer( sss, scan, pktbuf, pktsize );
+
+    if ( data_sent_len == pktsize )
     {
-        ssize_t data_sent_len;
-        n2n_sock_t *primary = (scan->connect_family == AF_INET6 && scan->sock6.family == AF_INET6)
-                              ? &scan->sock6 : &scan->sock;
-
-        /* WS edge goes via ws_send, otherwise UDP primary/fallback address families */
-        data_sent_len = sn_send_to_peer( sss, scan, pktbuf, pktsize );
-
-        if ( data_sent_len == pktsize )
-        {
-            ++(sss->stats.fwd);
-            if (cs) update_community_traffic(cs, pktsize, now);
-            traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s",
+        ++(sss->stats.fwd);
+        if (cs) update_community_traffic(cs, pktsize, now);
+        traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s",
+                   pktsize,
+                   sock_to_cstr( sockbuf, primary ),
+                   macaddr_str(mac_buf, scan->mac_addr),
+                   scan->ws ? " (ws)" : "");
+    }
+    else
+    {
+        int err = errno;
+        ++(sss->stats.errors);
+        /* EAGAIN is expected transient packet loss (TCP buffer full), do not spam */
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s EAGAIN (drop)",
                        pktsize,
                        sock_to_cstr( sockbuf, primary ),
                        macaddr_str(mac_buf, scan->mac_addr),
                        scan->ws ? " (ws)" : "");
+        } else {
+            traceEvent(TRACE_WARNING, "unicast %lu to [%s] %s%s FAILED (%d: %s)",
+                       pktsize,
+                       sock_to_cstr( sockbuf, primary ),
+                       macaddr_str(mac_buf, scan->mac_addr),
+                       scan->ws ? " (ws)" : "",
+                       err, strerror(err));
         }
-        else
-        {
-            int err = errno;
-            ++(sss->stats.errors);
-            /* EAGAIN is expected transient packet loss (TCP buffer full), do not spam */
-            if (err == EAGAIN || err == EWOULDBLOCK) {
-                traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s EAGAIN (drop)",
-                           pktsize,
-                           sock_to_cstr( sockbuf, primary ),
-                           macaddr_str(mac_buf, scan->mac_addr),
-                           scan->ws ? " (ws)" : "");
-            } else {
-                traceEvent(TRACE_WARNING, "unicast %lu to [%s] %s%s FAILED (%d: %s)",
-                           pktsize,
-                           sock_to_cstr( sockbuf, primary ),
-                           macaddr_str(mac_buf, scan->mac_addr),
-                           scan->ws ? " (ws)" : "",
-                           err, strerror(err));
-            }
-        }
-    }
-    else
-    {
-        traceEvent( TRACE_DEBUG, "try_forward unknown MAC" );
-
-        /* Not a known MAC so drop. */
     }
 
     return 0;
