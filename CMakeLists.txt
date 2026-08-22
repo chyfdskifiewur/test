@@ -43,18 +43,22 @@ include_directories(${PROJECT_SOURCE_DIR} src)
 # compiling only one would cause struct mismatch crashes.
 include(CheckCCompilerFlag)
 if(NOT MSVC)
+  # Speck SIMD + aggressive, aliasing-safe optimization.
+  # The Speck code relies heavily on uint64_t casts from byte buffers; GCC's
+  # strict-aliasing analysis can miscompile or pessimize these macros at -O2+.
+  set(SPECK_CFLAGS "-O3 -fno-strict-aliasing")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|x86|i.86)$")
     check_c_compiler_flag("-msse4.2" N2N_HAVE_SSE42)
     if(N2N_HAVE_SSE42)
-      set_source_files_properties(src/speck.c src/transform_speck.c
-        PROPERTIES COMPILE_FLAGS "-msse4.2")
+      set(SPECK_CFLAGS "${SPECK_CFLAGS} -msse4.2")
       message(STATUS "Speck: SSE4.2 SIMD enabled")
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set_source_files_properties(src/speck.c src/transform_speck.c
-      PROPERTIES COMPILE_DEFINITIONS "SPECK_ARM_NEON")
+    set(SPECK_CFLAGS "${SPECK_CFLAGS} -DSPECK_ARM_NEON")
     message(STATUS "Speck: ARM NEON SIMD enabled")
   endif()
+  set_source_files_properties(src/speck.c src/transform_speck.c
+    PROPERTIES COMPILE_FLAGS "${SPECK_CFLAGS}")
 endif()
 
 add_definitions(-DN2N_VERSION=\"${N2N_VERSION}\")
