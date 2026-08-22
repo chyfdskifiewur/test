@@ -150,7 +150,7 @@ typedef struct route {
     uint8_t gateway[IPV6_SIZE];
 } route;
 
-#define N2N_MAX_TRANSFORMS      16
+#define N2N_MAX_TRANSFORMS      5
 
 /* N2N_IFNAMSIZ is needed on win32 even if dev_name is not used after declaration */
 #ifndef _WIN32
@@ -254,6 +254,9 @@ struct peer_info {
     uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
+    /* Compact packet protocol support (version 0xE5 header) */
+    uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
+    uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
     /* WebSocket: non-NULL means this edge is connected via WS, forwarding uses ws_send instead of UDP sendto */
     ws_conn_t *         ws;
 };
@@ -335,7 +338,9 @@ int query_mgmt(uint16_t mgmt_port);
 
 /* Operations on peer_info lists. */
 struct peer_info * find_peer_by_mac( struct peer_info * list,
-                                     const n2n_mac_t mac );
+                                    const n2n_mac_t mac );
+struct peer_info * find_peer_by_sock( struct peer_info * list,
+                                      const struct sockaddr * sa );
 void   peer_list_add( struct peer_info * * list,
                       struct peer_info * element );
 size_t peer_list_size( const struct peer_info * list );
