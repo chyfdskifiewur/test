@@ -2,7 +2,7 @@ project(n2n C)
 cmake_minimum_required(VERSION 3.7)
 
 # N2n information
-set(N2N_VERSION 2.3_7.2)
+set(N2N_VERSION 2.3_7.3)
 set(N2N_OSNAME ${CMAKE_SYSTEM_NAME})
 
 # Append git revision if available (e.g., 2.3_6.3_r565_976242f)
@@ -32,6 +32,30 @@ MESSAGE(STATUS "Git not available, version: ${N2N_VERSION_FULL}")
 endif()
 
 include_directories(${PROJECT_SOURCE_DIR} src)
+
+# Speck SIMD acceleration (experiment):
+#   x86_64/i686 (GCC/Clang): -msse4.2 enables the SSE path in speck.c
+#     (~2x crypto throughput; J1800/Bay Trail and all 2010+ x86 support it).
+#     MSVC x64 already enables SSE via _M_AMD64 (see speck.h).
+#   aarch64: NEON is baseline hardware on all ARMv8 CPUs; just define SPECK_ARM_NEON.
+# IMPORTANT: -msse4.2 must apply to BOTH speck.c and transform_speck.c —
+# speck_context_t layout differs between scalar (272B) and SIMD (816B) paths;
+# compiling only one would cause struct mismatch crashes.
+include(CheckCCompilerFlag)
+if(NOT MSVC)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|x86|i.86)$")
+    check_c_compiler_flag("-msse4.2" N2N_HAVE_SSE42)
+    if(N2N_HAVE_SSE42)
+      set_source_files_properties(src/speck.c src/transform_speck.c
+        PROPERTIES COMPILE_FLAGS "-msse4.2")
+      message(STATUS "Speck: SSE4.2 SIMD enabled")
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set_source_files_properties(src/speck.c src/transform_speck.c
+      PROPERTIES COMPILE_DEFINITIONS "SPECK_ARM_NEON")
+    message(STATUS "Speck: ARM NEON SIMD enabled")
+  endif()
+endif()
 
 add_definitions(-DN2N_VERSION=\"${N2N_VERSION}\")
 add_definitions(-DN2N_VERSION_FULL=\"${N2N_VERSION_FULL}\")
