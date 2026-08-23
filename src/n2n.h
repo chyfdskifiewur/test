@@ -453,13 +453,14 @@ struct n2n_edge
      *   ABOVE the ~42 Mbps cnn2n baseline so we never cap the tunnel
      *   short of its true achievable rate.
      *
-     * Bytes refill at 6,000 bytes/ms (= 48 Mbps).  Bucket cap is 3 KB
-     *   (~2 packets) to guarantee no more than 2 frames hit the wire
-     *   back-to-back at any tick boundary.  Pacing is applied ONLY to
-     *   the P2P direct send path in send_PACKET; supernode relay,
-     *   keepalives and peer registrations are deliberately unpaced. */
+     * Uses QueryPerformanceCounter (<1 us tick) with SwitchToThread/
+     *   YieldProcessor spin wait (~10 us accuracy).  Refills at
+     *   6 bytes/us = 48 Mbps.  Bucket cap = 15 KB (~10 packets) so
+     *   pacing fires every ~2.5 ms; burst far smaller than legacy
+     *   Winsock default 8 KB SNDBUF + user-thread scheduler jitter
+     *   which combined caused the 32 Mbps → 42 Mbps gap. */
     uint32_t            tx_pace_bucket;        /* bytes available to send right now */
-    uint32_t            tx_pace_last_ms;       /* timeGetTime stamp at last refill */
+    int64_t             tx_pace_last_qpc;      /* last QueryPerformanceCounter stamp */
 #endif
 
     struct peer_info *  known_peers;

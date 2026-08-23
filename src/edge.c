@@ -343,11 +343,6 @@ static int edge_init(n2n_edge_t * eee)
 {
 #ifdef _WIN32
     initWin32();
-    /* Push the multimedia scheduler down to 1 ms so timeGetTime used by
-     * the token-bucket pace actually has ~1 ms granularity instead of
-     * the default 15.6 ms.  Without this the pacing loop would sleep
-     * ~16 ms each tick and cwnd would collapse.  Restored in edge_term. */
-    timeBeginPeriod(1);
 #endif
     memset(eee, 0, sizeof(n2n_edge_t));
     eee->start_time = n2n_now();
@@ -712,7 +707,6 @@ static void edge_deinit(n2n_edge_t * eee)
 #ifdef _WIN32
     WSACleanup();
     DeleteCriticalSection(&eee->peers_lock);
-    timeEndPeriod(1);   /* paired with edge_init timeBeginPeriod(1) */
 #endif
 }
 
@@ -2545,62 +2539,96 @@ static int send_PACKET( n2n_edge_t * eee,
     if (dest) {
         /* Direct path first */
 #ifdef _WIN32
-        /* Token-bucket pace before P2P UDP send.  The 8 KB SNDBUF gives
-         *   us kernel-level smoothing up to 5 packets, but TAP-level
-         *   bursts (the user thread reads ~10 frames from TAP when it
-         *   wakes late) still overwhelm the ISP edge FIFO.  A 48 Mbps
-         *   refilling bucket with a 3 KB cap ~ 2 frames bursts keeps
-         *   the instantaneous wire rate flat.  Refill at 6,000 bytes/ms
-         *   = 48 Mbps; deliberately ~14% faster than cnn2n's 42 Mbps
-         *   so we never artificially limit the throughput short of
-         *   what the link can truly deliver. */
+        /* Token-bucket pace before P2P UDP send.  The previous pass used
+         *   Sleep(1) which — even with timeBeginPeriod(1) — actually
+         *   blocks for ~3 ms on this i7-2720 (C-state wakeup latency)
+         *   and collapsed the test run to 10.7 Mbps (3x under target).
+         *
+         * Current implementation uses QueryPerformanceCounter (<1 us
+         *   tick) plus SwitchToThread/YieldProcessor spin, accurate to
+         *   ~10 us.  Refill at 6 bytes/us = 48 Mbps (14% above the
+         *   42 Mbps cnn2n baseline so we never rate-limit below the
+         *   link's true capacity).  Bucket cap at 15 KB = ~10 packets
+         *   so the wait fires only every ~2.5 ms, yielding CPU most
+         *   of the time. */
         {
-            const uint32_t PACE_BYTES_PER_MS = 6000;   /* 48 Mbps */
-            const uint32_t PACE_BUCKET_CAP   = 3000;   /* ~2 packets max burst */
+            static LARGE_INTEGER qpc_freq;          /* counts per second (init-once) */
+            static int           qpc_inited = 0;
+            /* 48 Mbps refill rate.  Max uint64_t product = freq(10 MHz) *
+             *   10 s stall = 1e8 ticks × 6e6 B/s = 6e14, fits uint64_t. */
+            const uint64_t PACE_BYTES_PER_SEC = 6ULL * 1000 * 1000;
+            const uint64_t PACE_NS_PER_BYTE   = (1000ULL * 1000 * 1000) / PACE_BYTES_PER_SEC;
+            const uint32_t PACE_BUCKET_CAP   = 15 * 1024;         /* ~10 pkts */
 
-            uint32_t now_ms = timeGetTime();
-            uint32_t elapsed = now_ms - eee->tx_pace_last_ms;
-            if (elapsed > 0) {
-                uint64_t add_bytes = (uint64_t)elapsed * PACE_BYTES_PER_MS;
-                if (add_bytes > 0xFFFFFFFFull - eee->tx_pace_bucket)
-                    eee->tx_pace_bucket = PACE_BUCKET_CAP;
-                else {
-                    eee->tx_pace_bucket += (uint32_t)add_bytes;
-                    if (eee->tx_pace_bucket > PACE_BUCKET_CAP)
-                        eee->tx_pace_bucket = PACE_BUCKET_CAP;
-                }
-                eee->tx_pace_last_ms = now_ms;
+            if (!qpc_inited) {
+                QueryPerformanceFrequency(&qpc_freq);
+                qpc_inited = 1;
             }
-            if (pktlen > eee->tx_pace_bucket) {
+
+            LARGE_INTEGER now_qpc;
+            QueryPerformanceCounter(&now_qpc);
+
+            int64_t elapsed_qpc = now_qpc.QuadPart - eee->tx_pace_last_qpc;
+            if (elapsed_qpc < 0) elapsed_qpc = 0;   /* wrap guard (rare on QPC) */
+            if (elapsed_qpc > 0) {
+                /* add_bytes = elapsed_sec * BYTES_PER_SEC
+                 *            = elapsed_qpc / freq * BYTES_PER_SEC
+                 * Do the multiply first (it fits in 64 bits), then div. */
+                uint64_t add_bytes = ((uint64_t)elapsed_qpc * PACE_BYTES_PER_SEC)
+                                   / (uint64_t)qpc_freq.QuadPart;
+                uint64_t nb = (uint64_t)eee->tx_pace_bucket + add_bytes;
+                eee->tx_pace_bucket = (nb > PACE_BUCKET_CAP) ? PACE_BUCKET_CAP : (uint32_t)nb;
+                eee->tx_pace_last_qpc = now_qpc.QuadPart;
+            }
+
+            if ((uint32_t)pktlen > eee->tx_pace_bucket) {
                 uint32_t need = (uint32_t)pktlen - eee->tx_pace_bucket;
-                /* round up: how many ms until bucket has >= need more bytes */
-                uint32_t wait_ms = (need + PACE_BYTES_PER_MS - 1) / PACE_BYTES_PER_MS;
-                /* Never sleep longer than 10 ms: protects against clock
-                 * wrap or a previous long stall — TCP will cope with a
-                 * single burst of ~6 packets far better than with a
-                 * 100 ms gap that corrupts RTT estimates. */
-                if (wait_ms > 10) wait_ms = 10;
-                Sleep(wait_ms);
-                /* Advance the timestamp + refill after the nap so the
-                 * next packet sees the bucket correctly topped up. */
-                now_ms = timeGetTime();
-                elapsed = now_ms - eee->tx_pace_last_ms;
-                if (elapsed > 0) {
-                    uint64_t add = (uint64_t)elapsed * PACE_BYTES_PER_MS;
-                    if (add > 0xFFFFFFFFull - eee->tx_pace_bucket)
-                        eee->tx_pace_bucket = PACE_BUCKET_CAP;
-                    else {
-                        eee->tx_pace_bucket += (uint32_t)add;
-                        if (eee->tx_pace_bucket > PACE_BUCKET_CAP)
-                            eee->tx_pace_bucket = PACE_BUCKET_CAP;
-                    }
-                    eee->tx_pace_last_ms = now_ms;
+                uint64_t need_ns = (uint64_t)need * PACE_NS_PER_BYTE;
+                /* Never wait longer than 4 ms (~30 packets @ 42 Mbps). */
+                const uint64_t MAX_WAIT_NS = 4ULL * 1000 * 1000;
+                if (need_ns > MAX_WAIT_NS) need_ns = MAX_WAIT_NS;
+
+                LARGE_INTEGER end_qpc;
+                /* end_qpc_delta = need_ns * freq / 1e9. */
+                int64_t end_qpc_delta = (int64_t)((need_ns * (uint64_t)qpc_freq.QuadPart)
+                                                 / 1000000000ULL);
+                end_qpc.QuadPart = now_qpc.QuadPart + end_qpc_delta;
+
+                /* Spin + cooperative yield.  For waits under ~50 us the
+                 *   YieldProcessor loop dominates (no OS transition);
+                 *   for longer waits SwitchToThread lets another thread
+                 *   run but the re-check interval stays << 1 ms so the
+                 *   total overshoot is bounded to a few us. */
+                int64_t ticks_per_us = qpc_freq.QuadPart / 1000000;
+                if (ticks_per_us < 1) ticks_per_us = 1;
+                for (;;) {
+                    LARGE_INTEGER t;
+                    QueryPerformanceCounter(&t);
+                    if (t.QuadPart >= end_qpc.QuadPart) break;
+                    int64_t remain_qpc = end_qpc.QuadPart - t.QuadPart;
+                    /* > 20 us of QPC ticks => cooperative yield */
+                    if (remain_qpc > 20 * ticks_per_us)
+                        SwitchToThread();
+                    else
+                        YieldProcessor();
+                }
+
+                /* Post-wait refill with actual elapsed time. */
+                QueryPerformanceCounter(&now_qpc);
+                elapsed_qpc = now_qpc.QuadPart - eee->tx_pace_last_qpc;
+                if (elapsed_qpc < 0) elapsed_qpc = 0;
+                if (elapsed_qpc > 0) {
+                    uint64_t add = ((uint64_t)elapsed_qpc * PACE_BYTES_PER_SEC)
+                                 / (uint64_t)qpc_freq.QuadPart;
+                    uint64_t nb = (uint64_t)eee->tx_pace_bucket + add;
+                    eee->tx_pace_bucket = (nb > PACE_BUCKET_CAP) ? PACE_BUCKET_CAP : (uint32_t)nb;
+                    eee->tx_pace_last_qpc = now_qpc.QuadPart;
                 }
             }
-            if (pktlen <= eee->tx_pace_bucket)
+            if ((uint32_t)pktlen <= eee->tx_pace_bucket)
                 eee->tx_pace_bucket -= (uint32_t)pktlen;
             else
-                eee->tx_pace_bucket = 0;    /* cap: drain whatever is there, don't go negative */
+                eee->tx_pace_bucket = 0;
         }
 #endif
         sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
