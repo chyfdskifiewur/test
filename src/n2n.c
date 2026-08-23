@@ -101,22 +101,20 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
 
     /* Leave IP_TOS at the OS default (0 = Best Effort). The original n2n set
      * 0x10 (DSCP CS1), which some carrier QoS policies classify as low-priority
-     * and rate-limit, capping tunnel throughput well below line rate. A null
-     * DSCP avoids that classification. */
+     * and rate-limit, capping tunnel throughput well below line rate (~53 Mbps
+     * vs ~82 Mbps for the same link). A null DSCP avoids that classification. */
     { int tos = 0; setsockopt(sock_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)); }
     {
         int buf_sz = 2 * 1024 * 1024;  /* 2MB */
 #ifdef _WIN32
         /* Windows default UDP rcvbuf is only 8-64KB, causing burst packet loss
          * when the main loop is briefly delayed (PEERS_LOCK, keepalive, etc.).
-         * Request 2MB on all platforms (kernel may double it). Linux leaves
-         * SO_SNDBUF at ~200KB by default, which overflows on burst sends and,
-         * combined with the non-blocking socket, drops packets via EAGAIN. */
+         * Linux is already set to 2MB. Windows may silently reduce to a lower
+         * value if the requested size exceeds the system max, but 2MB is safe. */
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&buf_sz, sizeof(buf_sz));
         setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&buf_sz, sizeof(buf_sz));
 #else
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
-        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
 #endif
     }
 
