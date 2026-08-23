@@ -57,8 +57,16 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
     {
-        u_long mode = 1;
-        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* PlanB: socket stays in BLOCKING mode so sendto naturally
+         *   back-pressures: when the kernel send buffer is full, sendto
+         *   blocks until buffer space is available.  This stalls the
+         *   single main-loop thread, which stops submitting new TAP
+         *   reads, which fills the TAP driver RX ring, which back-
+         *   pressures the user-space TCP writing to the TAP — exactly
+         *   the same mechanism as cnn2n (blocking socket, separate
+         *   TAP thread).  No retry loop needed, no wasted Sleep(1) or
+         *   select() waits.  select(timeout=0) for readability polling
+         *   works identically on blocking WinSock sockets. */
         /* Prevent WSAECONNRESET error spam on Windows when ICMP
          * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;
@@ -140,10 +148,7 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
     {
-        u_long mode = 1;
-        ioctlsocket(sock_fd, FIONBIO, &mode);
-        /* Prevent WSAECONNRESET error spam on Windows when ICMP
-         * port unreachable messages arrive for this UDP socket. */
+        /* PlanB: blocking socket (same rationale as open_socket). */
         DWORD bytesReturned = 0;
         BOOL newBehavior = FALSE;
         WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),
