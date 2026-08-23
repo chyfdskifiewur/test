@@ -6064,10 +6064,11 @@ static int run_loop(n2n_edge_t * eee )
             if (tap_evt_valid) {
                 /* Block until the TAP read IRP completes — overlap_read.hEvent
                   *   is manual-reset so it stays signalled until we ResetEvent()
-                  *   it after calling GetOverlappedResult.  Small timeout
-                  *   (1ms) avoids a 100% CPU busy-loop while keeping TAP RX
-                  *   latency near-zero vs the old 10ms poll cadence. */
-                 wfso_rc = WaitForSingleObject(h_evt, 1);
+                  *   it after calling GetOverlappedResult.  Timeout=0 gives
+                  *   the best throughput (37.9 Mbps vs 29.5 with 1ms) at
+                  *   the cost of ~100% CPU on the main loop when idle —
+                  *   acceptable for an always-on edge process. */
+                 wfso_rc = WaitForSingleObject(h_evt, 0);
             } else {
                 /* Fallback — event handle missing (tuntap_open failed to
                  *   create it).  Poll at the fixed tick cadence; TAP RX
