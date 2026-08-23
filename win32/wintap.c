@@ -144,6 +144,33 @@ static uint32_t set_static_routes(struct tuntap_dev* device) {
     return rc;
 }
 
+/* Set the TAP adapter MTU on Windows.
+ *
+ * tap-windows6 leaves the TAP MTU at 1500. n2n wraps every TAP frame in its own
+ * PACKET header plus (with encryption) a transform header, so a full 1500-byte
+ * payload exceeds the wire MTU and gets IP-fragmented. Linux avoids this because
+ * its TAP MTU is DEFAULT_MTU (1350). Match Linux on Windows so the -M option
+ * actually takes effect and the whole datagram stays below the wire MTU.
+ * Requires elevation, which edge already needs to configure the TAP adapter. */
+static uint32_t set_interface_mtu(struct tuntap_dev *device, uint32_t mtu) {
+    MIB_IPINTERFACE_ROW ifrow;
+    DWORD rc;
+
+    if (device->ifIdx == NET_IFINDEX_UNSPECIFIED)
+        return ERROR_INVALID_PARAMETER;
+
+    InitializeIpInterfaceEntry(&ifrow);
+    ifrow.Family = AF_INET;
+    ifrow.InterfaceIndex = device->ifIdx;
+
+    rc = GetIpInterfaceEntry(&ifrow);
+    if (rc != NO_ERROR)
+        return rc;
+
+    ifrow.NlMtu = mtu;
+    return SetIpInterfaceEntry(&ifrow);
+}
+
 int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
     HKEY key, key2;
     LONG rc;
@@ -294,8 +321,13 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
 
         tuntap_get_address(device);
 
-        if(device->mtu != DEFAULT_MTU)
-            traceEvent(TRACE_WARNING, "MTU set is not supported on Windows");
+        {
+            DWORD mtu_rc = set_interface_mtu(device, device->mtu);
+            if (mtu_rc != NO_ERROR)
+                traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
+            else
+                traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
+        }
 
         /* set driver media status to 'connected' */
         if (!DeviceIoControl(
@@ -555,8 +587,13 @@ int tuntap_restart( tuntap_dev* device ) {
 
     tuntap_get_address(device);
 
-    if(device->mtu != DEFAULT_MTU)
-        traceEvent(TRACE_WARNING, "MTU set is not supported on Windows");
+    {
+        DWORD mtu_rc = set_interface_mtu(device, device->mtu);
+        if (mtu_rc != NO_ERROR)
+            traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
+        else
+            traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
+    }
 
     if (!DeviceIoControl(
         device->device_handle, TAP_WIN_IOCTL_SET_MEDIA_STATUS,

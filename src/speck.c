@@ -224,10 +224,9 @@ int speck_expand_key (const unsigned char *k, speck_context_t *ctx) {
 }
 
 
-/* SSE path is GCC/Clang-only. On Windows MSVC this 128-bit SIMD Speck measured
- * SLOWER than the plain-C scalar path (forward ~28 Mbps with -A5 vs ~46 Mbps
- * with -A1). Let MSVC fall through to plain C below for x86 parity with Linux. */
-#elif defined (__SSE4_2__) // SSE support (GCC/Clang only) -------------------------------------------------
+/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
+ * always has SSSE3+ which is all the SSE path needs. */
+#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
 
 
 #define LCS(x,r) (((x)<<r)|((x)>>(64-r)))
