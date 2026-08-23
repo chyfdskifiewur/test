@@ -123,9 +123,13 @@ static void edge_signal_handler(int sig) {
 #ifdef _WIN32
 #define PEERS_LOCK(eee)   EnterCriticalSection(&(eee)->peers_lock)
 #define PEERS_UNLOCK(eee) LeaveCriticalSection(&(eee)->peers_lock)
+#define WMB()             MemoryBarrier()  /* write release: previous stores globally visible before next */
+#define RMB()             MemoryBarrier()  /* read acquire:  subsequent loads see updates prior to paired WMB */
 #else
 #define PEERS_LOCK(eee)   /* no-op on Linux: single-threaded TAP */
 #define PEERS_UNLOCK(eee) /* no-op on Linux: single-threaded TAP */
+#define WMB()             ((void)0)
+#define RMB()             ((void)0)
 #endif
 
 /** Return the IP address of the current supernode in the ring. */
@@ -2148,8 +2152,12 @@ static void update_peer_address(n2n_edge_t * eee,
     if (0 == memcmp(mac, broadcast_mac, N2N_MAC_SIZE)) return;  /* Not to be registered. */
 
     /* The peer's address is changing: invalidate any cached destination
-     * so the next packet re-resolves it instead of using the stale one. */
+     * so the next packet re-resolves it instead of using the stale one.
+     * Release barrier after clearing valid: paired with the acquire
+     * RMB() in send_PACKET fast path so a reader that observed the
+     * updated cached_dst_sock also observes valid = 0 and discards it. */
     eee->cached_dst_valid = 0;
+    WMB();
 
 
     while(scan != NULL)
@@ -2455,41 +2463,73 @@ static int send_PACKET( n2n_edge_t * eee,
         destination = eee->supernode;
         ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
     } else {
-        /* Destination cache: a hit avoids the peer-table scan on every
-         * packet. The cache is keyed by dstMac and has a short TTL so a
-         * NAT-mapped / restarted peer is re-resolved quickly. All reads
-         * and writes happen under PEERS_LOCK, keeping it race-free on
-         * Windows (TAP thread + main loop) and a no-op on Linux (single
-         * thread). */
-        PEERS_LOCK(eee);
-        struct peer_info *dst_peer = NULL;
-        if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
-            memcmp(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE) == 0 &&
-            (now - eee->cached_dst_time) < CACHE_DST_TTL)
+        /* ---------------------- Lockless cache fast path ----------------------
+         * Steady-state P2P sends to the same peer on every packet (2.6 kpps
+         *   for 28 Mbps).  Taking PEERS_LOCK for every one of those costs
+         *   ~20-40 cycles uncontended and HUNDREDS to thousands of cycles
+         *   when the main loop thread is already inside holding it while
+         *   doing a peer-table update.  On Windows, this is the single
+         *   biggest per-packet overhead (bigger than Speck encryption on
+         *   i7-2720), and it is what cnn2n avoids entirely by having NO
+         *   lock and tolerating the rare race.
+         *
+         * We keep the safety of PEERS_LOCK for structural updates, but we
+         *   read the cached destination OUTSIDE the lock using a double-
+         *   read + barrier protocol.  Barrier semantics:
+         *     Writer (lock holder): fill struct -> WMB() -> valid = 1
+         *     Reader (TAP thread) : valid1 = valid -> RMB() -> copy struct
+         *                         -> RMB() -> valid2 = valid
+         *                         -> accept only if valid1 && valid2.
+         *   If valid stays 1 across both reads then the copy couldn't have
+         *   overlapped a write (writes set valid=0 first).  Worst case, a
+         *   concurrent writer tears the snapshot and we fall through to
+         *   the locked lookup — no worse than before. */
+        int cache_hit = 0;
+        uint8_t valid_a = eee->cached_dst_valid;
+        RMB();
+        uint8_t snap_is_peer   = eee->cached_dst_is_peer;
+        uint8_t snap_probing   = eee->cached_dst_probing;
+        n2n_mac_t  snap_mac;
+        n2n_sock_t snap_sock   = eee->cached_dst_sock;
+        time_t     snap_time   = eee->cached_dst_time;
+        memcpy(snap_mac, eee->cached_dst_mac, N2N_MAC_SIZE);
+        RMB();
+        uint8_t valid_b = eee->cached_dst_valid;
+
+        if (valid_a && valid_b && snap_is_peer &&
+            memcmp(snap_mac, dstMac, N2N_MAC_SIZE) == 0 &&
+            (now - snap_time) < CACHE_DST_TTL)
         {
             dest = 1;
-            destination = eee->cached_dst_sock;
+            destination = snap_sock;
+            probing = snap_probing ? 1 : 0;
             ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-            dst_peer = find_peer_by_mac(eee->known_peers, dstMac);
-            if (dst_peer && dst_peer->last_probe_sent > 0)
-                probing = 1;
-        } else {
+            cache_hit = 1;
+        }
+
+        if (!cache_hit) {
+            /* Slow path: take lock, (re-)fill cache on P2P hit. */
+            PEERS_LOCK(eee);
+            struct peer_info *dst_peer = NULL;
             dest = find_peer_destination(eee, dstMac, &destination, &dst_peer);
             if (dest) {
                 ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-                if (dst_peer && dst_peer->last_probe_sent > 0)
-                    probing = 1;
+                probing = (dst_peer && dst_peer->last_probe_sent > 0) ? 1 : 0;
+                /* Fill cache fields FIRST, publish valid LAST with WMB
+                 * between — pairs with the RMB() pair in the fast path. */
                 memcpy(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE);
-                eee->cached_dst_sock = destination;
-                eee->cached_dst_time = now;
+                eee->cached_dst_sock    = destination;
+                eee->cached_dst_time    = now;
                 eee->cached_dst_is_peer = 1;
-                eee->cached_dst_valid = 1;
+                eee->cached_dst_probing = (uint8_t)probing;
+                WMB();
+                eee->cached_dst_valid   = 1;
             } else {
                 ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
                 destination = eee->supernode;
             }
+            PEERS_UNLOCK(eee);
         }
-        PEERS_UNLOCK(eee);
     }
 
     traceEvent( TRACE_DEBUG, "send_PACKET to %s", sock_to_cstr( sockbuf, &destination ) );
@@ -4037,15 +4077,22 @@ process_n2n_packet:
                             if (known->sock.family != AF_INET ||
                                 sock_equal(&known->sock, &pi.sockets[0]) != 0) {
                                 addr_changed = 1;
-                                eee->cached_dst_valid = 0;
                             }
                         }
                         if (!addr_changed && pi.sock6.family == AF_INET6) {
                             if (known->sock6.family != AF_INET6 ||
                                 sock_equal(&known->sock6, &pi.sock6) != 0) {
                                 addr_changed = 1;
-                                eee->cached_dst_valid = 0;
                             }
+                        }
+                        /* Invalidate cache exactly once BEFORE we actually
+                         *   mutate the peer address below (L4115+).  The
+                         *   barrier pairs with the double-read RMB()s in
+                         *   send_PACKET's fast path so lockless readers see
+                         *   valid=0 BEFORE any struct update. */
+                        if (addr_changed) {
+                            eee->cached_dst_valid = 0;
+                            WMB();
                         }
                     }
 

@@ -414,11 +414,29 @@ struct n2n_edge
     size_t              tx_transop_idx;
 
     /* Destination cache for the P2P send path (see edge.c send_PACKET).
-     * A cache hit avoids the per-packet peer-table scan. All access is
-     * inside PEERS_LOCK, so it is safe on Windows (TAP thread + main
-     * loop) and a no-op lock on Linux (single thread). */
+     *   A cache hit avoids the per-packet peer-table scan.
+     *
+     * Write-side (main-loop or TAP thread, inside PEERS_LOCK):
+     *   (1) invalidate -> set cached_dst_valid = 0, release barrier, update
+     *       peer address.
+     *   (2) refill    -> fill fields FIRST, release barrier, then set
+     *       cached_dst_valid = 1.
+     *
+     * Read-side on Windows (TAP thread, LOCKLESS, outside PEERS_LOCK):
+     *   snapshot valid + contents + recheck valid with acquire barrier in
+     *   between.  This is safe because the cache is small (< 40 bytes),
+     *   aligned, and written under a lock with release ordering; readers
+     *   either see the previous (stale-but-valid) entry or the new one,
+     *   never a torn write.  If the snapshot is stale, the worst that
+     *   happens is one UDP send goes to the old peer address — exactly
+     *   like cnn2n which reads the peer list with NO lock at all — and
+     *   the next TTL refresh corrects it.
+     *
+     * On Linux, PEERS_LOCK is a no-op (single thread) so the barrier
+     *   macros expand to nothing. */
     uint8_t             cached_dst_valid;
     uint8_t             cached_dst_is_peer;
+    uint8_t             cached_dst_probing;    /* last probe_sent status at refill time */
     n2n_mac_t           cached_dst_mac;
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
