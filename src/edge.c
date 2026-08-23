@@ -785,23 +785,21 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
+    /* PlanB single-thread: retry loop would block the main thread,
+     * preventing UDP ACK processing and destroying throughput.
+     * If the send buffer is full, drop the packet — TCP retransmits.
+     * The 128-loop in the main loop processes ACKs quickly so TCP
+     * can recover from any loss. */
+#ifndef _WIN32
     for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
-#ifdef _WIN32
-        if( WSAGetLastError() != WSAEWOULDBLOCK )
-            break;
-        /* Blocking socket: WSAEWOULDBLOCK never happens, this retry
-         * loop is dead code on Windows.  Keep it for safety in case
-         * the socket mode changes. */
-        Sleep(1);
-#else
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
         usleep(1000);
-#endif
         sent = sendto( fd, buf, len, 0/*flags*/,
                        (struct sockaddr*) &peer_addr, addr_len );
     }
+#endif
 
     if ( sent < 0 )
     {
@@ -3269,11 +3267,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     traceEvent(TRACE_DEBUG, "mgmt status rq");
 
-    /* Drain any stale data from mgmt_sock before sending response
-     * — single recvfrom is sufficient for a blocking socket */
+    /* Drain any stale data from mgmt_sock before sending response */
     {
         uint8_t discard[256];
-        recvfrom(eee->mgmt_sock, (char*)discard, sizeof(discard), 0, NULL, NULL);
+        while (recvfrom(eee->mgmt_sock, (char*)discard, sizeof(discard), 0, NULL, NULL) > 0) {}
     }
 
     /* Send community info */
@@ -6187,16 +6184,20 @@ static int run_loop(n2n_edge_t * eee )
             /* Any or all of the FDs could have input; check them all. */
             if(FD_ISSET(eee->udp_sock, &socket_mask))
             {
-                /* Read one packet.  With a blocking socket, a loop would
-                 * hang — recvfrom blocks on the second call after the
-                 * buffer is drained.  select(timeout=0) before the next
-                 * tick picks up any remaining packets. */
-                readFromIPSocket(eee, eee->udp_sock);
+                /* Drain UDP queue: read until no more packets (non-blocking).
+                 * 128 cap prevents starvation of other FDs (TAP, mgmt, etc). */
+                for (int _di = 0; _di < 128; _di++) {
+                    if (!readFromIPSocket(eee, eee->udp_sock))
+                        break;
+                }
             }
 
             if(eee->udp_sock6 != -1 && FD_ISSET(eee->udp_sock6, &socket_mask))
             {
-                readFromIPSocket(eee, eee->udp_sock6);
+                for (int _di = 0; _di < 128; _di++) {
+                    if (!readFromIPSocket(eee, eee->udp_sock6))
+                        break;
+                }
             }
 
             /* WS mode: handle WebSocket fd read */
