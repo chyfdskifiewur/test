@@ -6059,12 +6059,13 @@ static int run_loop(n2n_edge_t * eee )
             HANDLE h_evt = eee->device.overlap_read.hEvent;
             BOOL tap_evt_valid = (h_evt != NULL);
 
+            DWORD wfso_rc = WAIT_TIMEOUT;
             if (tap_evt_valid) {
                 /* Block for up to N2N_MAINLOOP_TICK_MS on the TAP read
                  *   completion event.  overlap_read.hEvent is manual-reset
                  *   so it stays signalled until we explicitly ResetEvent()
                  *   it after calling GetOverlappedResult. */
-                WaitForSingleObject(h_evt, (DWORD)N2N_MAINLOOP_TICK_MS);
+                wfso_rc = WaitForSingleObject(h_evt, (DWORD)N2N_MAINLOOP_TICK_MS);
             } else {
                 /* Fallback — event handle missing (tuntap_open failed to
                  *   create it).  Poll at the fixed tick cadence; TAP RX
@@ -6080,14 +6081,21 @@ static int run_loop(n2n_edge_t * eee )
                 Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
             }
 
-            /* If an overlapped TAP read was in flight and the event
-             *   fired, harvest the result now. */
-            if (eee->device.read_pending) {
-                /* (Even if we timed out instead of getting a signal,
-                 *   the IRP could have completed between the kernel
-                 *   timeout check and us getting here — so we rely on
-                 *   `read_pending` as the single source of truth, not
-                 *   on WFSO's return code.) */
+            /* ONLY harvest the overlapped read when the event was actually
+             *   signalled (WAIT_OBJECT_0) — i.e. the IRP has completed.
+             *   read_pending just means "an IRP was submitted", NOT "the
+             *   IRP completed": on a WFSO timeout the IRP is still pending
+             *   on overlap_read and MUST NOT be touched.  Calling
+             *   GetOverlappedResult(bWait=FALSE) on a still-pending IRP
+             *   fails with ERROR_IO_INCOMPLETE, and — worse — clearing
+             *   read_pending then submitting a fresh ReadFile reuses the
+             *   same OVERLAPPED structure while the previous IRP is still
+             *   in flight (undefined; every subsequent ReadFile fails) —
+             *   this was the warning flood at wintap.c:524/492 on idle
+             *   startup.  Leaving read_pending=1 alone is correct: the
+             *   pending IRP completes on a future tick and the
+             *   manual-reset event wakes us immediately then. */
+            if (wfso_rc == WAIT_OBJECT_0 && eee->device.read_pending) {
                 ResetEvent(eee->device.overlap_read.hEvent);
                 ssize_t len = tuntap_read_complete_overlapped(&eee->device);
                 if (len > 0) {
@@ -6103,7 +6111,7 @@ static int run_loop(n2n_edge_t * eee )
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
                 }
-            } else {
+            } else if (!eee->device.read_pending) {
                 /* read_pending == 0 means no IRP was in flight on
                  *   entry to the tick (previous submit failed, or we
                  *   got here via shutdown / transient error path).
@@ -6113,6 +6121,8 @@ static int run_loop(n2n_edge_t * eee )
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
                 }
             }
+            /* else: WFSO timed out with an IRP still pending — leave it
+             *       in flight and fall through to the socket poll below. */
 
             /* Zero-timeout poll walks every fd (UDP v4/v6, mgmt,
              *   WS, bypass proxy & conns — read and write sets) using
