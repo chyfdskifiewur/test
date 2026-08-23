@@ -14,13 +14,9 @@ typedef struct {
     u256 rk[34];
     u64 key[34];
 } speck_context_t;
-/* MSVC doesn't define __SSE4_2__ even on x64.  Rather than guessing SSE4.2
- *   availability from _M_AMD64 alone (Sandy Bridge i7-2xxx does have SSE4.2
- *   but, when mixed with AVX code paths in the process, incurs a 60-cycle
- *   AVX<->SSE transition penalty on every packet, making SSE slower than
- *   scalar C), we keep MSVC on the pure-C path — exactly matching cnn2n
- *   behaviour on Windows (cnn2n speck.h guards on __SSE4_2__ only). */
-#elif defined (__SSE4_2__) // SSE support -------------------------------------------------
+/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
+ * always has SSSE3+ which is all the SSE path needs. */
+#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
 #define SPECK_ALIGNED_CTX 16
 #define SPECK_CTX_BYVAL 1
 #include <immintrin.h>

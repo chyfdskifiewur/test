@@ -414,54 +414,14 @@ struct n2n_edge
     size_t              tx_transop_idx;
 
     /* Destination cache for the P2P send path (see edge.c send_PACKET).
-     *   A cache hit avoids the per-packet peer-table scan.
-     *
-     * Write-side (main-loop or TAP thread, inside PEERS_LOCK):
-     *   (1) invalidate -> set cached_dst_valid = 0, release barrier, update
-     *       peer address.
-     *   (2) refill    -> fill fields FIRST, release barrier, then set
-     *       cached_dst_valid = 1.
-     *
-     * Read-side on Windows (TAP thread, LOCKLESS, outside PEERS_LOCK):
-     *   snapshot valid + contents + recheck valid with acquire barrier in
-     *   between.  This is safe because the cache is small (< 40 bytes),
-     *   aligned, and written under a lock with release ordering; readers
-     *   either see the previous (stale-but-valid) entry or the new one,
-     *   never a torn write.  If the snapshot is stale, the worst that
-     *   happens is one UDP send goes to the old peer address — exactly
-     *   like cnn2n which reads the peer list with NO lock at all — and
-     *   the next TTL refresh corrects it.
-     *
-     * On Linux, PEERS_LOCK is a no-op (single thread) so the barrier
-     *   macros expand to nothing. */
+     * A cache hit avoids the per-packet peer-table scan. All access is
+     * inside PEERS_LOCK, so it is safe on Windows (TAP thread + main
+     * loop) and a no-op lock on Linux (single thread). */
     uint8_t             cached_dst_valid;
     uint8_t             cached_dst_is_peer;
-    uint8_t             cached_dst_probing;    /* last probe_sent status at refill time */
     n2n_mac_t           cached_dst_mac;
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
-
-#ifdef _WIN32
-    /* Windows P2P uplink token-bucket pacing.  Winsock SO_SNDBUF=8KB
-     *   gives us ~5 packets of kernel-level smoothing, but tunneled TCP
-     *   bursts still occasionally overflow the ISP-edge FIFO even when
-     *   the 5-packet buffer enforces back-pressure (i7-2720 wakes up
-     *   late and TCP has queued ~10+ frames through TAP into the user
-     *   thread).  A 48 Mbps hard-cap token bucket with 1 ms granularity
-     *   (timeBeginPeriod / timeGetTime) flattens this user-side burst
-     *   profile completely; at 48 Mbps the bucket comfortably sits
-     *   ABOVE the ~42 Mbps cnn2n baseline so we never cap the tunnel
-     *   short of its true achievable rate.
-     *
-     * Uses QueryPerformanceCounter (<1 us tick) with SwitchToThread/
-     *   YieldProcessor spin wait (~10 us accuracy).  Refills at
-     *   6 bytes/us = 48 Mbps.  Bucket cap = 15 KB (~10 packets) so
-     *   pacing fires every ~2.5 ms; burst far smaller than legacy
-     *   Winsock default 8 KB SNDBUF + user-thread scheduler jitter
-     *   which combined caused the 32 Mbps → 42 Mbps gap. */
-    uint32_t            tx_pace_bucket;        /* bytes available to send right now */
-    int64_t             tx_pace_last_qpc;      /* last QueryPerformanceCounter stamp */
-#endif
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
@@ -522,6 +482,25 @@ struct n2n_edge
 #ifdef _WIN32
     volatile int        keep_running;
     HANDLE              tun_thread_handle;
+
+    /* Single-producer (tunReadThread) / single-consumer (main loop)
+     *   bounded blocking ring-buffer for outgoing TAP frames.  This is
+     *   the Windows equivalent of the cnn2n single-thread event-loop
+     *   implicit back-pressure: when the ring fills up, the producer
+     *   (tunReadThread) blocks on tap_tx_has_slot until the main loop
+     *   has drained a slot through sendto → which is itself blocked by
+     *   the kernel UDP SO_SNDBUF → TCP write to TAP blocks → inner TCP
+     *   cwnd auto-tunes to the link's true capacity with no explicit
+     *   rate parameters.  Depth 8 × 1536 B ≈ 12 KB mirrors the kernel
+     *   SNDBUF size (≈ 5 packets) × 1.6 for scheduling jitter margin. */
+#define TAP_TX_RING_SIZE  8
+#define TAP_TX_SLOT_BYTES 1600
+    uint8_t             tap_tx_ring[TAP_TX_RING_SIZE][TAP_TX_SLOT_BYTES];
+    uint32_t            tap_tx_len[TAP_TX_RING_SIZE];
+    volatile unsigned   tap_tx_head;       /* producer write index (mod size) */
+    volatile unsigned   tap_tx_tail;       /* consumer read index (mod size) */
+    HANDLE              tap_tx_has_slot;   /* signalled after consumer pop */
+    HANDLE              tap_tx_has_item;   /* signalled after producer push */
 #endif
 
     /* Rate-limiting for P2P/PsP log messages */

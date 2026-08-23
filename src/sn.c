@@ -1393,15 +1393,7 @@ static int process_mgmt( n2n_sn_t * sss,
     /* Drain any stale data from mgmt_sock before sending response */
     {
         uint8_t discard[256];
-        for (;;) {
-#ifdef _WIN32
-            unsigned long nread = 0;
-            if (ioctlsocket(sss->mgmt_sock, FIONREAD, &nread) == SOCKET_ERROR || nread == 0)
-                break;
-#endif
-            ssize_t r = recvfrom(sss->mgmt_sock, (char*)discard, sizeof(discard), 0, NULL, NULL);
-            if (r <= 0) break;
-        }
+        while (recvfrom(sss->mgmt_sock, (char*)discard, sizeof(discard), 0, NULL, NULL) > 0) {}
     }
 
     /* Send header */

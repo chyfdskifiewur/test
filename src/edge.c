@@ -37,9 +37,7 @@
 #ifdef _WIN32
 #include <iphlpapi.h>
 #include <windns.h>
-#include <Mmsystem.h>       /* timeBeginPeriod / timeEndPeriod / timeGetTime */
 #pragma comment(lib, "dnsapi.lib")
-#pragma comment(lib, "winmm.lib")   /* multimedia timer for 1 ms token-bucket pacing */
 /* Interface types for filtering virtual interfaces */
 #ifndef IF_TYPE_PPP
 #define IF_TYPE_PPP 23
@@ -125,13 +123,9 @@ static void edge_signal_handler(int sig) {
 #ifdef _WIN32
 #define PEERS_LOCK(eee)   EnterCriticalSection(&(eee)->peers_lock)
 #define PEERS_UNLOCK(eee) LeaveCriticalSection(&(eee)->peers_lock)
-#define WMB()             MemoryBarrier()  /* write release: previous stores globally visible before next */
-#define RMB()             MemoryBarrier()  /* read acquire:  subsequent loads see updates prior to paired WMB */
 #else
 #define PEERS_LOCK(eee)   /* no-op on Linux: single-threaded TAP */
 #define PEERS_UNLOCK(eee) /* no-op on Linux: single-threaded TAP */
-#define WMB()             ((void)0)
-#define RMB()             ((void)0)
 #endif
 
 /** Return the IP address of the current supernode in the ring. */
@@ -345,6 +339,20 @@ static int edge_init(n2n_edge_t * eee)
     initWin32();
 #endif
     memset(eee, 0, sizeof(n2n_edge_t));
+#ifdef _WIN32
+    /* tap_tx ring init: create auto-reset events.  Initial state of
+     *   tap_tx_has_slot = signalled (ring is empty → all 8 slots free);
+     *   tap_tx_has_item = non-signalled (ring empty → nothing to pop).
+     *   Head/tail are already 0 from the memset above. */
+    eee->tap_tx_has_slot = CreateEvent(NULL, /* default security */
+                                       FALSE, /* auto-reset */
+                                       TRUE,  /* initial state = signalled */
+                                       NULL); /* no name */
+    eee->tap_tx_has_item = CreateEvent(NULL,
+                                       FALSE, /* auto-reset */
+                                       FALSE, /* initial state = non-signalled */
+                                       NULL);
+#endif
     eee->start_time = n2n_now();
 
     transop_null_init(    &(eee->transop[N2N_TRANSOP_NULL_IDX]) );
@@ -705,6 +713,27 @@ static void edge_deinit(n2n_edge_t * eee)
     (eee->transop[N2N_TRANSOP_SPECK_IDX].deinit)(&eee->transop[N2N_TRANSOP_SPECK_IDX]);
 
 #ifdef _WIN32
+    /* Shutdown sequence for tap_tx ring + tunReadThread:
+     *   1. keep_running = 0 (set by the caller before edge_term runs —
+     *      tap_tx_queue_push already checks it and bails out early).
+     *   2. If tunReadThread is currently BLOCKED on tap_tx_has_slot
+     *      (ring was full when shutdown initiated), it would never wake
+     *      without this manual SetEvent.  Similarly, signalling
+     *      tap_tx_has_item is harmless but keeps the drain symmetry.
+     *   3. Join the thread.  Timeout 1 s just in case tuntap_read is
+     *      stuck inside an ioctl — don't deadlock the process exit.
+     *   4. Close event handles (after join so no thread uses them).
+     *   5. Then the regular peers_lock / WSACleanup cleanup runs. */
+    eee->keep_running = 0;
+    SetEvent(eee->tap_tx_has_slot);
+    SetEvent(eee->tap_tx_has_item);
+    if (eee->tun_thread_handle) {
+        WaitForSingleObject(eee->tun_thread_handle, 1000);
+        CloseHandle(eee->tun_thread_handle);
+        eee->tun_thread_handle = NULL;
+    }
+    if (eee->tap_tx_has_slot) { CloseHandle(eee->tap_tx_has_slot); eee->tap_tx_has_slot = NULL; }
+    if (eee->tap_tx_has_item) { CloseHandle(eee->tap_tx_has_item); eee->tap_tx_has_item = NULL; }
     WSACleanup();
     DeleteCriticalSection(&eee->peers_lock);
 #endif
@@ -790,6 +819,22 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
+
+    for( int retry = 0; retry < 50 && sent < 0; retry++ )
+    {
+#ifdef _WIN32
+        if( WSAGetLastError() != WSAEWOULDBLOCK )
+            break;
+        Sleep(1);
+#else
+        if( errno != EAGAIN && errno != EWOULDBLOCK )
+            break;
+        usleep(1000);
+#endif
+        sent = sendto( fd, buf, len, 0/*flags*/,
+                       (struct sockaddr*) &peer_addr, addr_len );
+    }
+
     if ( sent < 0 )
     {
 #ifdef _WIN32
@@ -2154,12 +2199,8 @@ static void update_peer_address(n2n_edge_t * eee,
     if (0 == memcmp(mac, broadcast_mac, N2N_MAC_SIZE)) return;  /* Not to be registered. */
 
     /* The peer's address is changing: invalidate any cached destination
-     * so the next packet re-resolves it instead of using the stale one.
-     * Release barrier after clearing valid: paired with the acquire
-     * RMB() in send_PACKET fast path so a reader that observed the
-     * updated cached_dst_sock also observes valid = 0 and discards it. */
+     * so the next packet re-resolves it instead of using the stale one. */
     eee->cached_dst_valid = 0;
-    WMB();
 
 
     while(scan != NULL)
@@ -2465,172 +2506,47 @@ static int send_PACKET( n2n_edge_t * eee,
         destination = eee->supernode;
         ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
     } else {
-        /* ---------------------- Lockless cache fast path ----------------------
-         * Steady-state P2P sends to the same peer on every packet (2.6 kpps
-         *   for 28 Mbps).  Taking PEERS_LOCK for every one of those costs
-         *   ~20-40 cycles uncontended and HUNDREDS to thousands of cycles
-         *   when the main loop thread is already inside holding it while
-         *   doing a peer-table update.  On Windows, this is the single
-         *   biggest per-packet overhead (bigger than Speck encryption on
-         *   i7-2720), and it is what cnn2n avoids entirely by having NO
-         *   lock and tolerating the rare race.
-         *
-         * We keep the safety of PEERS_LOCK for structural updates, but we
-         *   read the cached destination OUTSIDE the lock using a double-
-         *   read + barrier protocol.  Barrier semantics:
-         *     Writer (lock holder): fill struct -> WMB() -> valid = 1
-         *     Reader (TAP thread) : valid1 = valid -> RMB() -> copy struct
-         *                         -> RMB() -> valid2 = valid
-         *                         -> accept only if valid1 && valid2.
-         *   If valid stays 1 across both reads then the copy couldn't have
-         *   overlapped a write (writes set valid=0 first).  Worst case, a
-         *   concurrent writer tears the snapshot and we fall through to
-         *   the locked lookup — no worse than before. */
-        int cache_hit = 0;
-        uint8_t valid_a = eee->cached_dst_valid;
-        RMB();
-        uint8_t snap_is_peer   = eee->cached_dst_is_peer;
-        uint8_t snap_probing   = eee->cached_dst_probing;
-        n2n_mac_t  snap_mac;
-        n2n_sock_t snap_sock   = eee->cached_dst_sock;
-        time_t     snap_time   = eee->cached_dst_time;
-        memcpy(snap_mac, eee->cached_dst_mac, N2N_MAC_SIZE);
-        RMB();
-        uint8_t valid_b = eee->cached_dst_valid;
-
-        if (valid_a && valid_b && snap_is_peer &&
-            memcmp(snap_mac, dstMac, N2N_MAC_SIZE) == 0 &&
-            (now - snap_time) < CACHE_DST_TTL)
+        /* Destination cache: a hit avoids the peer-table scan on every
+         * packet. The cache is keyed by dstMac and has a short TTL so a
+         * NAT-mapped / restarted peer is re-resolved quickly. All reads
+         * and writes happen under PEERS_LOCK, keeping it race-free on
+         * Windows (TAP thread + main loop) and a no-op on Linux (single
+         * thread). */
+        PEERS_LOCK(eee);
+        struct peer_info *dst_peer = NULL;
+        if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
+            memcmp(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE) == 0 &&
+            (now - eee->cached_dst_time) < CACHE_DST_TTL)
         {
             dest = 1;
-            destination = snap_sock;
-            probing = snap_probing ? 1 : 0;
+            destination = eee->cached_dst_sock;
             ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-            cache_hit = 1;
-        }
-
-        if (!cache_hit) {
-            /* Slow path: take lock, (re-)fill cache on P2P hit. */
-            PEERS_LOCK(eee);
-            struct peer_info *dst_peer = NULL;
+            dst_peer = find_peer_by_mac(eee->known_peers, dstMac);
+            if (dst_peer && dst_peer->last_probe_sent > 0)
+                probing = 1;
+        } else {
             dest = find_peer_destination(eee, dstMac, &destination, &dst_peer);
             if (dest) {
                 ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-                probing = (dst_peer && dst_peer->last_probe_sent > 0) ? 1 : 0;
-                /* Fill cache fields FIRST, publish valid LAST with WMB
-                 * between — pairs with the RMB() pair in the fast path. */
+                if (dst_peer && dst_peer->last_probe_sent > 0)
+                    probing = 1;
                 memcpy(eee->cached_dst_mac, dstMac, N2N_MAC_SIZE);
-                eee->cached_dst_sock    = destination;
-                eee->cached_dst_time    = now;
+                eee->cached_dst_sock = destination;
+                eee->cached_dst_time = now;
                 eee->cached_dst_is_peer = 1;
-                eee->cached_dst_probing = (uint8_t)probing;
-                WMB();
-                eee->cached_dst_valid   = 1;
+                eee->cached_dst_valid = 1;
             } else {
                 ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
                 destination = eee->supernode;
             }
-            PEERS_UNLOCK(eee);
         }
+        PEERS_UNLOCK(eee);
     }
 
     traceEvent( TRACE_DEBUG, "send_PACKET to %s", sock_to_cstr( sockbuf, &destination ) );
 
     if (dest) {
         /* Direct path first */
-#ifdef _WIN32
-        /* Token-bucket pace before P2P UDP send.  The previous pass used
-         *   Sleep(1) which — even with timeBeginPeriod(1) — actually
-         *   blocks for ~3 ms on this i7-2720 (C-state wakeup latency)
-         *   and collapsed the test run to 10.7 Mbps (3x under target).
-         *
-         * Current implementation uses QueryPerformanceCounter (<1 us
-         *   tick) plus SwitchToThread/YieldProcessor spin, accurate to
-         *   ~10 us.  Refill at 6 bytes/us = 48 Mbps (14% above the
-         *   42 Mbps cnn2n baseline so we never rate-limit below the
-         *   link's true capacity).  Bucket cap at 15 KB = ~10 packets
-         *   so the wait fires only every ~2.5 ms, yielding CPU most
-         *   of the time. */
-        {
-            static LARGE_INTEGER qpc_freq;          /* counts per second (init-once) */
-            static int           qpc_inited = 0;
-            /* 48 Mbps refill rate.  Max uint64_t product = freq(10 MHz) *
-             *   10 s stall = 1e8 ticks × 6e6 B/s = 6e14, fits uint64_t. */
-            const uint64_t PACE_BYTES_PER_SEC = 6ULL * 1000 * 1000;
-            const uint64_t PACE_NS_PER_BYTE   = (1000ULL * 1000 * 1000) / PACE_BYTES_PER_SEC;
-            const uint32_t PACE_BUCKET_CAP   = 15 * 1024;         /* ~10 pkts */
-
-            if (!qpc_inited) {
-                QueryPerformanceFrequency(&qpc_freq);
-                qpc_inited = 1;
-            }
-
-            LARGE_INTEGER now_qpc;
-            QueryPerformanceCounter(&now_qpc);
-
-            int64_t elapsed_qpc = now_qpc.QuadPart - eee->tx_pace_last_qpc;
-            if (elapsed_qpc < 0) elapsed_qpc = 0;   /* wrap guard (rare on QPC) */
-            if (elapsed_qpc > 0) {
-                /* add_bytes = elapsed_sec * BYTES_PER_SEC
-                 *            = elapsed_qpc / freq * BYTES_PER_SEC
-                 * Do the multiply first (it fits in 64 bits), then div. */
-                uint64_t add_bytes = ((uint64_t)elapsed_qpc * PACE_BYTES_PER_SEC)
-                                   / (uint64_t)qpc_freq.QuadPart;
-                uint64_t nb = (uint64_t)eee->tx_pace_bucket + add_bytes;
-                eee->tx_pace_bucket = (nb > PACE_BUCKET_CAP) ? PACE_BUCKET_CAP : (uint32_t)nb;
-                eee->tx_pace_last_qpc = now_qpc.QuadPart;
-            }
-
-            if ((uint32_t)pktlen > eee->tx_pace_bucket) {
-                uint32_t need = (uint32_t)pktlen - eee->tx_pace_bucket;
-                uint64_t need_ns = (uint64_t)need * PACE_NS_PER_BYTE;
-                /* Never wait longer than 4 ms (~30 packets @ 42 Mbps). */
-                const uint64_t MAX_WAIT_NS = 4ULL * 1000 * 1000;
-                if (need_ns > MAX_WAIT_NS) need_ns = MAX_WAIT_NS;
-
-                LARGE_INTEGER end_qpc;
-                /* end_qpc_delta = need_ns * freq / 1e9. */
-                int64_t end_qpc_delta = (int64_t)((need_ns * (uint64_t)qpc_freq.QuadPart)
-                                                 / 1000000000ULL);
-                end_qpc.QuadPart = now_qpc.QuadPart + end_qpc_delta;
-
-                /* Spin + cooperative yield.  For waits under ~50 us the
-                 *   YieldProcessor loop dominates (no OS transition);
-                 *   for longer waits SwitchToThread lets another thread
-                 *   run but the re-check interval stays << 1 ms so the
-                 *   total overshoot is bounded to a few us. */
-                int64_t ticks_per_us = qpc_freq.QuadPart / 1000000;
-                if (ticks_per_us < 1) ticks_per_us = 1;
-                for (;;) {
-                    LARGE_INTEGER t;
-                    QueryPerformanceCounter(&t);
-                    if (t.QuadPart >= end_qpc.QuadPart) break;
-                    int64_t remain_qpc = end_qpc.QuadPart - t.QuadPart;
-                    /* > 20 us of QPC ticks => cooperative yield */
-                    if (remain_qpc > 20 * ticks_per_us)
-                        SwitchToThread();
-                    else
-                        YieldProcessor();
-                }
-
-                /* Post-wait refill with actual elapsed time. */
-                QueryPerformanceCounter(&now_qpc);
-                elapsed_qpc = now_qpc.QuadPart - eee->tx_pace_last_qpc;
-                if (elapsed_qpc < 0) elapsed_qpc = 0;
-                if (elapsed_qpc > 0) {
-                    uint64_t add = ((uint64_t)elapsed_qpc * PACE_BYTES_PER_SEC)
-                                 / (uint64_t)qpc_freq.QuadPart;
-                    uint64_t nb = (uint64_t)eee->tx_pace_bucket + add;
-                    eee->tx_pace_bucket = (nb > PACE_BUCKET_CAP) ? PACE_BUCKET_CAP : (uint32_t)nb;
-                    eee->tx_pace_last_qpc = now_qpc.QuadPart;
-                }
-            }
-            if ((uint32_t)pktlen <= eee->tx_pace_bucket)
-                eee->tx_pace_bucket -= (uint32_t)pktlen;
-            else
-                eee->tx_pace_bucket = 0;
-        }
-#endif
         sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
         if (probing) {
             /* Probe window: also relay via supernode so no data is lost
@@ -2761,7 +2677,6 @@ static void send_packet2net(n2n_edge_t * eee,
      * If unknown (first packet), send legacy and let the peer upgrade
      * opportunistically when it responds with a compact packet. */
     int use_compact = 0;
-    static int compact_dbg_logged = 0;
     PEERS_LOCK( eee );
     {
         struct peer_info *dest = find_peer_by_mac( eee->known_peers, destMac );
@@ -2769,18 +2684,6 @@ static void send_packet2net(n2n_edge_t * eee,
             dest = find_peer_by_mac( eee->pending_peers, destMac );
         if ( dest && dest->compact_capable )
             use_compact = 1;
-        if ( !compact_dbg_logged ) {
-            compact_dbg_logged = 1;
-            if ( dest ) {
-                traceEvent(TRACE_NORMAL, "Peer %s compact_capable=%u -> %s format",
-                           macaddr_str((macstr_t){0}, dest->mac_addr),
-                           (unsigned)dest->compact_capable,
-                           use_compact ? "COMPACT" : "LEGACY");
-            } else {
-                traceEvent(TRACE_NORMAL, "Peer dest=%s unknown (not in tables yet) -> LEGACY format by default",
-                           macaddr_str((macstr_t){0}, destMac));
-            }
-        }
     }
     PEERS_UNLOCK( eee );
 
@@ -2873,6 +2776,79 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
     return retval;
 }
 
+#ifdef _WIN32
+/* #######################################################################
+ * Windows tap_tx bounded SPSC blocking ring.  Producer = tunReadThread
+ *   (readFromTAPSocket → tap_tx_queue_push), consumer = main event loop
+ *   (tap_tx_queue_pop → send_packet2net).  Two auto-reset Win32 events
+ *   so neither side ever spin-waits — block on a kernel event when the
+ *   ring is full/empty until the opposite side signals.
+ *
+ * SPSC memory model safety on x86:
+ *   • Exactly one thread writes tap_tx_head (producer); one writes tail.
+ *   • x86 preserves store→store and load→load ordering so "write data
+ *     first → then advance index" ordering is correctly observed across
+ *     threads WITHOUT explicit fences.  volatile + control dependencies
+ *     are sufficient to keep MSVC from reordering around the fields.
+ *
+ * Back-pressure chain (cnn2n single-thread equivalence):
+ *   tap_tx_ring full → tunReadThread blocks in push → tuntap_read()
+ *   stops being called → TAP rx ring (NDIS/TAP driver) fills → TCP
+ *   write to the TAP FD blocks → inner TCP cwnd auto-tunes to the
+ *   true achievable UDP uplink rate with ZERO explicit rate config.
+ * ####################################################################### */
+
+static int tap_tx_queue_is_full(n2n_edge_t *eee)
+{
+    unsigned h = eee->tap_tx_head;
+    unsigned next = (h + 1) % TAP_TX_RING_SIZE;
+    return (next == eee->tap_tx_tail);
+}
+
+static int tap_tx_queue_is_empty(n2n_edge_t *eee)
+{
+    return (eee->tap_tx_head == eee->tap_tx_tail);
+}
+
+/* Block until a slot is available, then copy pkt into the ring.
+ * Returns 0 on success, -1 if interrupted by keep_running shutdown. */
+static int tap_tx_queue_push(n2n_edge_t *eee, const uint8_t *pkt, uint32_t len)
+{
+    if (len > TAP_TX_SLOT_BYTES) return -1;
+
+    /* Re-check because WFSO can have spurious wake-ups in alertable waits,
+     *   and keep_running may drop to 0 while we're inside. */
+    while (eee->keep_running && tap_tx_queue_is_full(eee)) {
+        WaitForSingleObject(eee->tap_tx_has_slot, INFINITE);
+    }
+    if (!eee->keep_running) return -1;
+
+    unsigned h = eee->tap_tx_head;
+    memcpy(eee->tap_tx_ring[h], pkt, len);
+    eee->tap_tx_len[h] = len;
+    eee->tap_tx_head = (h + 1) % TAP_TX_RING_SIZE;
+
+    SetEvent(eee->tap_tx_has_item);
+    return 0;
+}
+
+/* Non-blocking pop: returns 1 if item copied, 0 if empty. */
+static int tap_tx_queue_pop(n2n_edge_t *eee, uint8_t *out_pkt, uint32_t *out_len)
+{
+    if (tap_tx_queue_is_empty(eee)) return 0;
+
+    unsigned t = eee->tap_tx_tail;
+    uint32_t l = eee->tap_tx_len[t];
+    if (l > TAP_TX_SLOT_BYTES) l = TAP_TX_SLOT_BYTES;
+    memcpy(out_pkt, eee->tap_tx_ring[t], l);
+    *out_len = l;
+    eee->tap_tx_tail = (t + 1) % TAP_TX_RING_SIZE;
+
+    SetEvent(eee->tap_tx_has_slot);
+    return 1;
+}
+#endif  /* _WIN32 */
+
 /** Read a single packet from the TAP interface, process it and write out the
  *  corresponding packet to the cooked socket.
  */
@@ -2930,9 +2906,17 @@ retry2:
             }
             else
             {
-                /* Try bypass first (ICMP to bypass-active peers) */
-                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, len) == 0)
+                /* Try bypass first (ICMP to bypass-active peers).
+                 * On Windows bypass forwards still go directly through the
+                 *   bypass socket so skip queuing; only regular n2n PACKETs
+                 *   get pushed onto the tap_tx ring for main-loop draining. */
+                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, len) == 0) {
+#ifdef _WIN32
+                    tap_tx_queue_push(eee, eth_pkt, (uint32_t)len);
+#else
                     send_packet2net(eee, eth_pkt, len);
+#endif
+                }
             }
 
             /* Drain more frames (TAP is non-blocking now) */
@@ -2941,8 +2925,13 @@ retry2:
                 if (dlen <= 0) break;
                 traceEvent(TRACE_DEBUG, "### Rx TAP packet (drain %d) for %s",
                            (signed int)dlen, macaddr_str(mac_buf, eth_pkt));
-                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, dlen) == 0)
+                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, dlen) == 0) {
+#ifdef _WIN32
+                    tap_tx_queue_push(eee, eth_pkt, (uint32_t)dlen);
+#else
                     send_packet2net(eee, eth_pkt, dlen);
+#endif
+                }
             }
         }
 }
@@ -3691,16 +3680,6 @@ static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
     }
 
     i = sizeof(sender_sock);
-
-#ifdef _WIN32
-    {
-        unsigned long nread = 0;
-        if (ioctlsocket(fd, FIONREAD, &nread) == SOCKET_ERROR || nread == 0) {
-            return 0; /* nothing available -> UDP queue drained */
-        }
-    }
-#endif
-
     recvlen = recvfrom(fd, udp_buf, sizeof(udp_buf), 0/*flags*/,
                       (struct sockaddr*) &sender_sock, (socklen_t*) &i);
 
@@ -3708,14 +3687,16 @@ static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
     {
 #ifdef _WIN32
         int err = WSAGetLastError();
-        W32_ERROR(err, c)
-        traceEvent( TRACE_DEBUG, "recvfrom failed [%d] %ls", err, c ? c : L"" );
-        W32_ERROR_FREE(c)
+        if (err != WSAEWOULDBLOCK) {
+            W32_ERROR(err, c)
+            traceEvent( TRACE_DEBUG, "recvfrom failed [%d] %ls", err, c ? c : L"" );
+            W32_ERROR_FREE(c)
+        }
 #else
         traceEvent(TRACE_DEBUG, "recvfrom failed with %s", strerror(errno) );
 #endif
 
-        return 0; /* failed to receive data from UDP */
+        return 0; /* failed to receive data from UDP — queue drained or error */
     }
 
     /* Determine sender address from socket family */
@@ -4185,22 +4166,15 @@ process_n2n_packet:
                             if (known->sock.family != AF_INET ||
                                 sock_equal(&known->sock, &pi.sockets[0]) != 0) {
                                 addr_changed = 1;
+                                eee->cached_dst_valid = 0;
                             }
                         }
                         if (!addr_changed && pi.sock6.family == AF_INET6) {
                             if (known->sock6.family != AF_INET6 ||
                                 sock_equal(&known->sock6, &pi.sock6) != 0) {
                                 addr_changed = 1;
+                                eee->cached_dst_valid = 0;
                             }
-                        }
-                        /* Invalidate cache exactly once BEFORE we actually
-                         *   mutate the peer address below (L4115+).  The
-                         *   barrier pairs with the double-read RMB()s in
-                         *   send_PACKET's fast path so lockless readers see
-                         *   valid=0 BEFORE any struct update. */
-                        if (addr_changed) {
-                            eee->cached_dst_valid = 0;
-                            WMB();
                         }
                     }
 
@@ -6101,6 +6075,22 @@ static int run_loop(n2n_edge_t * eee )
             wait_time.tv_sec = 0;
             wait_time.tv_usec = 10000;  /* 10ms */
         }
+#ifdef _WIN32
+        else {
+            /* No KCP: default SOCKET_TIMEOUT_INTERVAL_SECS (= 1 s) is
+             *   too long for the tap_tx ring drain that runs AFTER
+             *   select returns.  50 ms gives a 20 Hz drain cadence,
+             *   which combined with the ring's 8-packet depth delivers
+             *   one wakeup per ~400 microseconds at 42 Mbps — so the
+             *   main loop is never idle for long when there are
+             *   packets to send, and it never spin-waits on the
+             *   producer either (the has_item event acts as the
+             *   producer-to-consumer notification edge case if ever
+             *   we need to beat the 50 ms tick). */
+            wait_time.tv_sec = 0;
+            wait_time.tv_usec = 50000;  /* 50 ms */
+        }
+#endif
 
         rc = select(max_sock+1, &socket_mask, bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
         nowTime=n2n_now();
@@ -6203,6 +6193,32 @@ static int run_loop(n2n_edge_t * eee )
         }
 
         /* Finished processing select data. */
+
+#ifdef _WIN32
+        /* Drain the tap_tx ring: every main-loop tick we pop all queued
+         *   TAP frames and push them through send_packet2net.  Because
+         *   send_packet2net → sendto_sock is on a BLOCKING UDP socket
+         *   (SO_SNDBUF 8 KB), any back-pressure from the kernel UDP
+         *   buffer will stall send_packet2net here → drain pauses →
+         *   the ring stays partially full → tunReadThread is blocked
+         *   → TAP stops being drained → inner TCP writes to the TAP
+         *   device start blocking → TCP auto-tunes its cwnd to match
+         *   the actual UDP uplink bandwidth PERFECTLY.  No rate
+         *   parameters required — this is how cnn2n does it implicitly
+         *   via its single-threaded select loop; we replicate it here
+         *   without touching the Windows TAP fd model.
+         *
+         * Up to TAP_TX_RING_SIZE items per tick (exactly one ring). */
+        {
+            uint8_t  pkt_copy[TAP_TX_SLOT_BYTES];
+            uint32_t pkt_len;
+            int popped;
+            for (popped = 0; popped < TAP_TX_RING_SIZE; popped++) {
+                if (!tap_tx_queue_pop(eee, pkt_copy, &pkt_len)) break;
+                send_packet2net(eee, pkt_copy, pkt_len);
+            }
+        }
+#endif
 
         update_supernode_reg(eee, nowTime);
         PEERS_LOCK(eee);

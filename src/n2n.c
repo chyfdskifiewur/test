@@ -56,18 +56,11 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
 #ifndef _WIN32
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
-    /* Blocking send/recv on UDP socket (aligned with cnn2n behavior).
-     *   sendto() blocks when the kernel send buffer is full — this provides
-     *   precise, microsecond-level backpressure (kernel wakes the thread as
-     *   soon as there's space).  A non-blocking socket by contrast would
-     *   return WSAEWOULDBLOCK instantly; user-space retry with Sleep(1)
-     *   suffers from the default 15.6 ms Windows timer granularity which
-     *   starves the TAP ACK clock and caps tunnelled TCP throughput
-     *   at ~28 Mbps vs ~42 Mbps with blocking on the same hardware.
-     *
-     * Drain loops use FIONREAD (edge) or single-per-select recv (sn) so
-     *   they do not rely on EAGAIN/WSAEWOULDBLOCK and remain safe. */
     {
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* Prevent WSAECONNRESET error spam on Windows when ICMP
+         * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;
         BOOL newBehavior = FALSE;
         WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),
@@ -76,36 +69,11 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
 #endif
 
 #ifdef _WIN32
-    /* Keep the receive path well-endowed (1 MB = good for bursts of ACKs
-     *   and P2P-peer forwarded data; this is what gave us 64 Mbps reverse
-     *   throughput and we must not touch it) but deliberately keep the
-     *   send path TIGHT.  Default Winsock UDP SNDBUF is only 8 KB and
-     *   cnn2n does not override it — their 42 Mbps is hit with that
-     *   tiny buffer.  When we bloated SO_SNDBUF to 1 MB we let the
-     *   application-layer TCP (running over TAP) push large bursts into
-     *   the kernel send queue; those micro-bursts then overflow the ISP
-     *   edge router's small FIFO on the uplink path, causing ~1-2%
-     *   random drops that the inner TCP interprets as congestion and
-     *   cuts cwnd so the tunnel tops out at ~28 Mbps.
-     *
-     * 64 KB is ~47 full-size (1428 B) frames, enough to smooth out
-     *   scheduler jitter on this 2nd-gen i7 while still forcing
-     *   sendto() to block (back-pressure) long before any per-second
-     *   buffering accumulates.  KCP bypass rate-limits itself so it
-     *   is equally happy with 64 KB as with 1 MB.
-     *
-     * UPDATE: 64 KB still left a ~10 Mbps gap vs cnn2n on the same
-     *   machine (42 vs 32 Mbps P2P uplink).  cnn2n NEVER sets SNDBUF
-     *   at all, so its UDP sockets run at the Winsock default of
-     *   ~8 KB (confirmed via getsockopt).  Therefore close the last
-     *   8x gap and go to 8 KB: only ~5 full-size frames in flight,
-     *   back-pressure fires every ~1.5 ms at 42 Mbps which exactly
-     *   flattens every microburst so the ISP FIFO never drops. */
+    /* Windows default UDP buffer is only 8KB, increase to 1MB for throughput */
     {
-        int rcvsize = 1024 * 1024;
-        int sndsize = 8 * 1024;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
-        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
+        int bufsize = 1024 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     }
 #endif
 
@@ -131,21 +99,11 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
         return -1;
     }
 
-    /* DSCP / TOS handling: the setsockopt(IP_TOS) path MUST be skipped on
-     *   Windows.  cnn2n does NOT make this call at all and gets 42 Mbps on
-     *   the same link; our call here — regardless of whether we pass 0 or
-     *   0x10 — causes the Windows TC / qWAVE subsystem to permanently
-     *   CLASSIFY the socket's 5-tuple into a DSCP-aware QoS flow (the
-     *   Winsock API returns success but the actual DSCP mark is ignored;
-     *   the HARM is entering the QoS scheduler instead of the default
-     *   Best Effort path).  On ADSL/FTTH links with carrier DPI this
-     *   consistently pins the tunnel uplink at ~28 Mbps while identical
-     *   non-QoS-classified sockets (cnn2n, default browser UDP flows)
-     *   run at 40-45 Mbps.  Linux still needs the explicit 0 because
-     *   the original upstream defaulted to 0x10 (DSCP CS1) there. */
-#ifndef _WIN32
+    /* Leave IP_TOS at the OS default (0 = Best Effort). The original n2n set
+     * 0x10 (DSCP CS1), which some carrier QoS policies classify as low-priority
+     * and rate-limit, capping tunnel throughput well below line rate (~53 Mbps
+     * vs ~82 Mbps for the same link). A null DSCP avoids that classification. */
     { int tos = 0; setsockopt(sock_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)); }
-#endif
     {
         int buf_sz = 2 * 1024 * 1024;  /* 2MB */
 #ifdef _WIN32
@@ -181,18 +139,11 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
 #ifndef _WIN32
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
-    /* Blocking send/recv on UDP socket (aligned with cnn2n behavior).
-     *   sendto() blocks when the kernel send buffer is full — this provides
-     *   precise, microsecond-level backpressure (kernel wakes the thread as
-     *   soon as there's space).  A non-blocking socket by contrast would
-     *   return WSAEWOULDBLOCK instantly; user-space retry with Sleep(1)
-     *   suffers from the default 15.6 ms Windows timer granularity which
-     *   starves the TAP ACK clock and caps tunnelled TCP throughput
-     *   at ~28 Mbps vs ~42 Mbps with blocking on the same hardware.
-     *
-     * Drain loops use FIONREAD (edge) or single-per-select recv (sn) so
-     *   they do not rely on EAGAIN/WSAEWOULDBLOCK and remain safe. */
     {
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* Prevent WSAECONNRESET error spam on Windows when ICMP
+         * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;
         BOOL newBehavior = FALSE;
         WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),
@@ -203,16 +154,11 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
     setsockopt(sock_fd, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&sockopt, sizeof(sockopt));
 
 #ifdef _WIN32
-    /* Match open_socket tuning (see there for detailed rationale): big
-     *   RCVBUF so inbound IPv6 does not drop, deliberately tight SNDBUF
-     *   so the uplink micro-bursts do not trigger ISP-side FIFO drops.
-     *   8 KB = cnn2n Winsock default (cnn2n never calls setsockopt on
-     *   SNDBUF; 64 KB still showed a 10 Mbps shortfall at 32 vs 42). */
+    /* Windows default UDP buffer is only 8KB, increase to match Linux (2MB) */
     {
-        int rcvsize = 2 * 1024 * 1024;
-        int sndsize = 8 * 1024;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
-        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
+        int bufsize = 2 * 1024 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     }
 #endif
 
