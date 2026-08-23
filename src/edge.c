@@ -339,20 +339,6 @@ static int edge_init(n2n_edge_t * eee)
     initWin32();
 #endif
     memset(eee, 0, sizeof(n2n_edge_t));
-#ifdef _WIN32
-    /* tap_tx ring init: create auto-reset events.  Initial state of
-     *   tap_tx_has_slot = signalled (ring is empty → all 8 slots free);
-     *   tap_tx_has_item = non-signalled (ring empty → nothing to pop).
-     *   Head/tail are already 0 from the memset above. */
-    eee->tap_tx_has_slot = CreateEvent(NULL, /* default security */
-                                       FALSE, /* auto-reset */
-                                       TRUE,  /* initial state = signalled */
-                                       NULL); /* no name */
-    eee->tap_tx_has_item = CreateEvent(NULL,
-                                       FALSE, /* auto-reset */
-                                       FALSE, /* initial state = non-signalled */
-                                       NULL);
-#endif
     eee->start_time = n2n_now();
 
     transop_null_init(    &(eee->transop[N2N_TRANSOP_NULL_IDX]) );
@@ -713,26 +699,6 @@ static void edge_deinit(n2n_edge_t * eee)
     (eee->transop[N2N_TRANSOP_SPECK_IDX].deinit)(&eee->transop[N2N_TRANSOP_SPECK_IDX]);
 
 #ifdef _WIN32
-    /* Shutdown sequence for tap_tx ring + tunReadThread:
-     *   1. keep_running = 0 — tap_tx_queue_push's loop guard exits.
-     *   2. Signal BOTH tap_tx events: tunReadThread may be blocked on
-     *      tap_tx_has_slot (ring was full at shutdown); signalling
-     *      wakes it immediately.
-     *   3. Join the thread (timeout 1 s: tuntap_read may be stuck in
-     *      an NDIS ioctl and never return — don't deadlock exit).
-     *   4. Clean up kernel events.
-     *   5. WSA events (order doesn't matter relative to tap_tx events
-     *      but cleanup after thread so no concurrent reference). */
-    eee->keep_running = 0;
-    SetEvent(eee->tap_tx_has_slot);
-    SetEvent(eee->tap_tx_has_item);
-    if (eee->tun_thread_handle) {
-        WaitForSingleObject(eee->tun_thread_handle, 1000);
-        CloseHandle(eee->tun_thread_handle);
-        eee->tun_thread_handle = NULL;
-    }
-    if (eee->tap_tx_has_slot) { CloseHandle(eee->tap_tx_has_slot); eee->tap_tx_has_slot = NULL; }
-    if (eee->tap_tx_has_item) { CloseHandle(eee->tap_tx_has_item); eee->tap_tx_has_item = NULL; }
     WSACleanup();
     DeleteCriticalSection(&eee->peers_lock);
 #endif
@@ -2775,78 +2741,33 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
     return retval;
 }
 
-#ifdef _WIN32
-/* #######################################################################
- * Windows tap_tx bounded SPSC blocking ring.  Producer = tunReadThread
- *   (readFromTAPSocket → tap_tx_queue_push), consumer = main event loop
- *   (tap_tx_queue_pop → send_packet2net).  Two auto-reset Win32 events
- *   so neither side ever spin-waits — block on a kernel event when the
- *   ring is full/empty until the opposite side signals.
- *
- * SPSC memory model safety on x86:
- *   • Exactly one thread writes tap_tx_head (producer); one writes tail.
- *   • x86 preserves store→store and load→load ordering so "write data
- *     first → then advance index" ordering is correctly observed across
- *     threads WITHOUT explicit fences.  volatile + control dependencies
- *     are sufficient to keep MSVC from reordering around the fields.
- *
- * Back-pressure chain (cnn2n single-thread equivalence):
- *   tap_tx_ring full → tunReadThread blocks in push → tuntap_read()
- *   stops being called → TAP rx ring (NDIS/TAP driver) fills → TCP
- *   write to the TAP FD blocks → inner TCP cwnd auto-tunes to the
- *   true achievable UDP uplink rate with ZERO explicit rate config.
- * ####################################################################### */
+/** Shared helper for Plan B (OVERLAPPED single-threaded TAP reader).
+ *  Process one raw Ethernet frame from TAP RX: apply multicast drop,
+ *  then try bypass fast-path, otherwise send via n2n overlay.
+ *  This is the EXACT same downstream path readFromTAPSocket uses,
+ *  extracted to a helper so we can call it from three places:
+ *    (1) pre-loop sync-drain of tuntap_read_begin_overlapped,
+ *    (2) after WaitForSingleObject returns on overlap_read.hEvent,
+ *    (3) sync-completion loop after re-submitting a read. */
+static inline void process_tap_rx_frame(n2n_edge_t *eee,
+                                        const uint8_t *buf, ssize_t len) {
+    macstr_t mac_buf;
+    const uint8_t *mac = buf;
 
-static int tap_tx_queue_is_full(n2n_edge_t *eee)
-{
-    unsigned h = eee->tap_tx_head;
-    unsigned next = (h + 1) % TAP_TX_RING_SIZE;
-    return (next == eee->tap_tx_tail);
-}
+    if (len <= 0)
+        return;
 
-static int tap_tx_queue_is_empty(n2n_edge_t *eee)
-{
-    return (eee->tap_tx_head == eee->tap_tx_tail);
-}
+    traceEvent(TRACE_DEBUG, "### Rx TAP packet (%4d) for %s",
+               (int)len, macaddr_str(mac_buf, mac));
 
-/* Block until a slot is available, then copy pkt into the ring.
- * Returns 0 on success, -1 if interrupted by keep_running shutdown. */
-static int tap_tx_queue_push(n2n_edge_t *eee, const uint8_t *pkt, uint32_t len)
-{
-    if (len > TAP_TX_SLOT_BYTES) return -1;
-
-    /* Re-check because WFSO can have spurious wake-ups in alertable waits,
-     *   and keep_running may drop to 0 while we're inside. */
-    while (eee->keep_running && tap_tx_queue_is_full(eee)) {
-        WaitForSingleObject(eee->tap_tx_has_slot, INFINITE);
+    if (eee->drop_multicast && is_ethMulticast(buf, len)) {
+        traceEvent(TRACE_DEBUG, "Dropping multicast");
+        return;
     }
-    if (!eee->keep_running) return -1;
 
-    unsigned h = eee->tap_tx_head;
-    memcpy(eee->tap_tx_ring[h], pkt, len);
-    eee->tap_tx_len[h] = len;
-    eee->tap_tx_head = (h + 1) % TAP_TX_RING_SIZE;
-
-    SetEvent(eee->tap_tx_has_item);
-    return 0;
+    if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, (uint8_t*)buf, len) == 0)
+        send_packet2net(eee, (uint8_t*)buf, len);
 }
-
-/* Non-blocking pop: returns 1 if item copied, 0 if empty. */
-static int tap_tx_queue_pop(n2n_edge_t *eee, uint8_t *out_pkt, uint32_t *out_len)
-{
-    if (tap_tx_queue_is_empty(eee)) return 0;
-
-    unsigned t = eee->tap_tx_tail;
-    uint32_t l = eee->tap_tx_len[t];
-    if (l > TAP_TX_SLOT_BYTES) l = TAP_TX_SLOT_BYTES;
-    memcpy(out_pkt, eee->tap_tx_ring[t], l);
-    *out_len = l;
-    eee->tap_tx_tail = (t + 1) % TAP_TX_RING_SIZE;
-
-    SetEvent(eee->tap_tx_has_slot);
-    return 1;
-}
-#endif  /* _WIN32 */
 
 /** Read a single packet from the TAP interface, process it and write out the
  *  corresponding packet to the cooked socket.
@@ -2905,17 +2826,9 @@ retry2:
             }
             else
             {
-                /* Try bypass first (ICMP to bypass-active peers).
-                 * On Windows bypass forwards still go directly through the
-                 *   bypass socket so skip queuing; only regular n2n PACKETs
-                 *   get pushed onto the tap_tx ring for main-loop draining. */
-                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, len) == 0) {
-#ifdef _WIN32
-                    tap_tx_queue_push(eee, eth_pkt, (uint32_t)len);
-#else
+                /* Try bypass first (ICMP to bypass-active peers) */
+                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, len) == 0)
                     send_packet2net(eee, eth_pkt, len);
-#endif
-                }
             }
 
             /* Drain more frames (TAP is non-blocking now) */
@@ -2924,13 +2837,8 @@ retry2:
                 if (dlen <= 0) break;
                 traceEvent(TRACE_DEBUG, "### Rx TAP packet (drain %d) for %s",
                            (signed int)dlen, macaddr_str(mac_buf, eth_pkt));
-                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, dlen) == 0) {
-#ifdef _WIN32
-                    tap_tx_queue_push(eee, eth_pkt, (uint32_t)dlen);
-#else
+                if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, eth_pkt, dlen) == 0)
                     send_packet2net(eee, eth_pkt, dlen);
-#endif
-                }
             }
         }
 }
@@ -6004,7 +5912,33 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    startTunReadThread(eee);
+    /* Plan B: single-threaded TAP reader using OVERLAPPED I/O —
+     *   architecture 100% aligned with cnn2n.  No tunReadThread,
+     *   no ring buffer, no cross-thread events.  TAP reads are
+     *   submitted as overlapped IRPs, completions are signalled
+     *   via overlap_read.hEvent directly to the main loop's
+     *   WaitForSingleObject, and frames flow straight from
+     *   tuntap_dev.read_buf → bypass_tap_forward → send_packet2net
+     *   on the SAME thread with zero intermediate queueing.  If
+     *   send_packet2net blocks on a full SO_SNDBUF, no further
+     *   TAP reads are submitted until it unblocks, so the TAP
+     *   driver's RX ring fills up and the user-space TCP that is
+     *   writing to the TAP gets back-pressure automatically —
+     *   zero parameters, fully auto-tuning to the real uplink
+     *   capacity just like cnn2n. */
+    {
+        /* Submit overlapped reads before entering the loop, draining
+         *   any frames that complete synchronously (backlog at startup
+         *   or very fast completions) so the IRP is guaranteed to be
+         *   in flight (read_pending != 0) when we enter WFSO. */
+        ssize_t slen;
+        while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+            process_tap_rx_frame(&eee, eee->device.read_buf, slen);
+        }
+        /* Normal exit: slen == 0 → async IRP in flight, read_pending=1.
+         *   If slen < 0 (error), we still proceed; the first main-loop
+         *   wakeup will re-submit via the same re-try loop below. */
+    }
 #endif
 
     /* Main loop
@@ -6018,9 +5952,9 @@ static int run_loop(n2n_edge_t * eee )
     {
         int rc, max_sock = 0;
         fd_set socket_mask;
+        struct timeval wait_time;
         time_t nowTime;
 
-        /* ---------- (1) Build FD sets (identical across platforms) ---------- */
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
         max_sock = (int) eee->udp_sock;
@@ -6067,62 +6001,97 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
 
-        /* ---------- (2) Fixed tick cadence.
-         *   10 ms covers three cases simultaneously:
-         *     (a) KCP's natural ikcp_update rhythm is 100 Hz,
-         *     (b) zero-latency TAP→UDP send path is handled by the
-         *         tap_tx_has_item event (see below), so the timeout
-         *         only affects the UDP RX / mgmt / WS / bypass-TCP
-         *         poll side — 0-10 ms extra latency on ingress is
-         *         invisible to interactive ping,
-         *     (c) avoids WSAEventSelect entirely — that function
-         *         silently flips sockets to non-blocking mode, which
-         *         would destroy the SO_SNDBUF-based back-pressure
-         *         the tap_tx ring relies on to auto-tune TCP cwnd.
-         *   Single constant, same value for all bandwidths, all peer
-         *   counts, all operating modes — completely generic. ---------- */
-        const unsigned long tick_ms = N2N_WIN_TICK_MS;
-
-        /* ---------- (3) Wait + poll dispatch.
-         *   Windows: WaitForSingleObject on tap_tx_has_item with the
-         *            fixed 10 ms timeout.  Two ways to wake:
-         *              • tunReadThread pushed a TAP frame → event fires
-         *                → we drain the ring immediately (0 added send
-         *                latency for ping replies / TCP acks).
-         *              • 10 ms timeout fires → poll everything.
-         *            After either wakeup, select(timeout=0) walks ALL
-         *            fds with the exact same POSIX logic as Linux —
-         *            UDP v4/v6 RX, mgmt_sock, WS fd, bypass proxy and
-         *            conn sockets (both read- and write-ready) — so
-         *            no fd type needs special-casing and no fd can
-         *            ever be starved longer than 10 ms.
-         *   Linux:   plain select(timeout=10 ms) — TAP fd is already
-         *            in the socket_mask so no extra notification is
-         *            required.
-         *   Both paths drain tap_tx (Windows) or read TAP directly
-         *   (Linux) after every wakeup, matching cnn2n's single-
-         *   threaded implicit back-pressure exactly. ---------- */
+        /* ---------- Wait / wake-up.
+         *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
+         *   EVERY deployment — it covers KCP's 100 Hz update cadence,
+         *   and 0-10 ms added ingress latency on non-TAP fds is
+         *   invisible on any real WAN RTT.  Completely generic.
+         *
+         *   Windows: Plan B — NO select(), NO separate tunReadThread.
+         *            We block on overlap_read.hEvent (the single kernel
+         *            notification that TAP driver has completed a read
+         *            IRP we submitted) and combine that with a 10 ms
+         *            upper bound for polling all ingress socket fds.
+         *            Architecture = cnn2n exactly:
+         *              WFSO → TAP frame ready? → process → send_packet2net
+         *                → if send_packet2net blocks on SO_SNDBUF full,
+         *                  we stall here; further TAP reads won't be
+         *                  submitted until it unblocks → TAP driver RX
+         *                  ring fills up → user-space TCP writing to
+         *                  TAP gets blocked → TCP cwnd auto-tunes to
+         *                  real uplink capacity.
+         *            After every wakeup (signal or timeout) we run
+         *            select(timeout=0) on the same fd sets as Linux,
+         *            so UDP/mgmt/WS/bypass TCP fds never need WinSock
+         *            event binding (which silently breaks SO_SNDBUF
+         *            back-pressure by forcing non-blocking mode).
+         *   Linux:   Classic select(timeout = 10 ms) — TAP fd already
+         *            lives in socket_mask so no extra handle is needed,
+         *            all I/O stays single-threaded. ---------- */
 #ifdef _WIN32
         {
-            /* Event is auto-reset: if signalled, WFSO returns
-             *   WAIT_OBJECT_0 and atomically clears the state. */
-            WaitForSingleObject(eee->tap_tx_has_item, (DWORD)tick_ms);
-            /* Zero-timeout poll walks every fd identically to Linux */
+            /* Block for up to N2N_MAINLOOP_TICK_MS on the TAP read
+             *   completion event.  overlap_read.hEvent is manual-reset
+             *   so it stays signalled until we explicitly ResetEvent()
+             *   it after calling GetOverlappedResult. */
+            WaitForSingleObject(eee->device.overlap_read.hEvent,
+                                (DWORD)N2N_MAINLOOP_TICK_MS);
+
+            /* If an overlapped TAP read was in flight and the event
+             *   fired, harvest the result now. */
+            if (eee->device.read_pending) {
+                /* (Even if we timed out instead of getting a signal,
+                 *   the IRP could have completed between the kernel
+                 *   timeout check and us getting here — so we rely on
+                 *   `read_pending` as the single source of truth, not
+                 *   on WFSO's return code.) */
+                ResetEvent(eee->device.overlap_read.hEvent);
+                ssize_t len = tuntap_read_complete_overlapped(&eee->device);
+                if (len > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, len);
+                }
+                /* Submit the NEXT read, and keep draining any frames
+                 *   that complete synchronously (driver backlog) until
+                 *   we've queued a real async IRP (read_pending=1).
+                 *   This guarantees we never enter WFSO without an IRP
+                 *   already pending — otherwise TAP traffic would have
+                 *   to wait for the timeout tick to get noticed. */
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                }
+            } else {
+                /* read_pending == 0 means no IRP was in flight on
+                 *   entry to the tick (previous submit failed, or we
+                 *   got here via shutdown / transient error path).
+                 *   Re-submit one so we don't lose TAP input. */
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                }
+            }
+
+            /* Zero-timeout poll walks every fd (UDP v4/v6, mgmt,
+             *   WS, bypass proxy & conns — read and write sets) using
+             *   the EXACT same POSIX loop body as Linux.  No fd
+             *   type needs WinSock-specific binding; every fd is
+             *   starved at most N2N_MAINLOOP_TICK_MS = 10 ms. */
             struct timeval zt;
-            zt.tv_sec = 0; zt.tv_usec = 0;
+            zt.tv_sec  = 0;
+            zt.tv_usec = 0;
             rc = select(max_sock + 1, &socket_mask,
                         bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
         }
 #else
         {
-            struct timeval wait_time;
-            wait_time.tv_sec  = tick_ms / 1000UL;
-            wait_time.tv_usec = (tick_ms % 1000UL) * 1000UL;
+            struct timeval tick;
+            tick.tv_sec  = 0;
+            tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;  /* 10 ms */
             rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &tick);
         }
 #endif
-        nowTime = n2n_now();
+        nowTime=n2n_now();
 
         /* Handle signal interruption */
         if (rc < 0) {
@@ -6222,33 +6191,6 @@ static int run_loop(n2n_edge_t * eee )
         }
 
         /* Finished processing select data. */
-
-#ifdef _WIN32
-        /* Drain the tap_tx ring after EVERY main-loop wakeup, regardless
-         *   of whether WFSO returned on tap_tx_has_item (signal from
-         *   tunReadThread after push) or timed out at the 10 ms tick.
-         *   send_packet2net → sendto_sock sits on a BLOCKING UDP socket
-         *   (SO_SNDBUF ≈ 8 KB) so kernel-level back-pressure stalls
-         *   this drain exactly when uplink is saturated.  That in turn
-         *   keeps the ring partially full → tunReadThread blocks
-         *   waiting for has_slot → the TAP device read queue backs up →
-         *   the inner TCP sender writing to TAP observes reduced window
-         *   and auto-tunes its cwnd to the real UDP uplink capacity.
-         *   No hand-tuned rate parameters are required — this is the
-         *   same implicit back-pressure the cnn2n single-threaded loop
-         *   achieves naturally, reproduced here without changing the
-         *   Windows TAP fd/thread model.
-         * Up to TAP_TX_RING_SIZE items per tick (one full ring depth). */
-        {
-            uint8_t  pkt_copy[TAP_TX_SLOT_BYTES];
-            uint32_t pkt_len;
-            int popped;
-            for (popped = 0; popped < TAP_TX_RING_SIZE; popped++) {
-                if (!tap_tx_queue_pop(eee, pkt_copy, &pkt_len)) break;
-                send_packet2net(eee, pkt_copy, pkt_len);
-            }
-        }
-#endif
 
         update_supernode_reg(eee, nowTime);
         PEERS_LOCK(eee);
