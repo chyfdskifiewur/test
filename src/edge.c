@@ -341,6 +341,11 @@ static int edge_init(n2n_edge_t * eee)
 {
 #ifdef _WIN32
     initWin32();
+    /* Push the multimedia scheduler down to 1 ms so timeGetTime used by
+     * the token-bucket pace actually has ~1 ms granularity instead of
+     * the default 15.6 ms.  Without this the pacing loop would sleep
+     * ~16 ms each tick and cwnd would collapse.  Restored in edge_term. */
+    timeBeginPeriod(1);
 #endif
     memset(eee, 0, sizeof(n2n_edge_t));
     eee->start_time = n2n_now();
@@ -705,6 +710,7 @@ static void edge_deinit(n2n_edge_t * eee)
 #ifdef _WIN32
     WSACleanup();
     DeleteCriticalSection(&eee->peers_lock);
+    timeEndPeriod(1);   /* paired with edge_init timeBeginPeriod(1) */
 #endif
 }
 
@@ -2536,6 +2542,65 @@ static int send_PACKET( n2n_edge_t * eee,
 
     if (dest) {
         /* Direct path first */
+#ifdef _WIN32
+        /* Token-bucket pace before P2P UDP send.  The 8 KB SNDBUF gives
+         *   us kernel-level smoothing up to 5 packets, but TAP-level
+         *   bursts (the user thread reads ~10 frames from TAP when it
+         *   wakes late) still overwhelm the ISP edge FIFO.  A 48 Mbps
+         *   refilling bucket with a 3 KB cap ~ 2 frames bursts keeps
+         *   the instantaneous wire rate flat.  Refill at 6,000 bytes/ms
+         *   = 48 Mbps; deliberately ~14% faster than cnn2n's 42 Mbps
+         *   so we never artificially limit the throughput short of
+         *   what the link can truly deliver. */
+        {
+            const uint32_t PACE_BYTES_PER_MS = 6000;   /* 48 Mbps */
+            const uint32_t PACE_BUCKET_CAP   = 3000;   /* ~2 packets max burst */
+
+            uint32_t now_ms = timeGetTime();
+            uint32_t elapsed = now_ms - eee->tx_pace_last_ms;
+            if (elapsed > 0) {
+                uint64_t add_bytes = (uint64_t)elapsed * PACE_BYTES_PER_MS;
+                if (add_bytes > 0xFFFFFFFFull - eee->tx_pace_bucket)
+                    eee->tx_pace_bucket = PACE_BUCKET_CAP;
+                else {
+                    eee->tx_pace_bucket += (uint32_t)add_bytes;
+                    if (eee->tx_pace_bucket > PACE_BUCKET_CAP)
+                        eee->tx_pace_bucket = PACE_BUCKET_CAP;
+                }
+                eee->tx_pace_last_ms = now_ms;
+            }
+            if (pktlen > eee->tx_pace_bucket) {
+                uint32_t need = (uint32_t)pktlen - eee->tx_pace_bucket;
+                /* round up: how many ms until bucket has >= need more bytes */
+                uint32_t wait_ms = (need + PACE_BYTES_PER_MS - 1) / PACE_BYTES_PER_MS;
+                /* Never sleep longer than 10 ms: protects against clock
+                 * wrap or a previous long stall — TCP will cope with a
+                 * single burst of ~6 packets far better than with a
+                 * 100 ms gap that corrupts RTT estimates. */
+                if (wait_ms > 10) wait_ms = 10;
+                Sleep(wait_ms);
+                /* Advance the timestamp + refill after the nap so the
+                 * next packet sees the bucket correctly topped up. */
+                now_ms = timeGetTime();
+                elapsed = now_ms - eee->tx_pace_last_ms;
+                if (elapsed > 0) {
+                    uint64_t add = (uint64_t)elapsed * PACE_BYTES_PER_MS;
+                    if (add > 0xFFFFFFFFull - eee->tx_pace_bucket)
+                        eee->tx_pace_bucket = PACE_BUCKET_CAP;
+                    else {
+                        eee->tx_pace_bucket += (uint32_t)add;
+                        if (eee->tx_pace_bucket > PACE_BUCKET_CAP)
+                            eee->tx_pace_bucket = PACE_BUCKET_CAP;
+                    }
+                    eee->tx_pace_last_ms = now_ms;
+                }
+            }
+            if (pktlen <= eee->tx_pace_bucket)
+                eee->tx_pace_bucket -= (uint32_t)pktlen;
+            else
+                eee->tx_pace_bucket = 0;    /* cap: drain whatever is there, don't go negative */
+        }
+#endif
         sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
         if (probing) {
             /* Probe window: also relay via supernode so no data is lost
@@ -2674,13 +2739,17 @@ static void send_packet2net(n2n_edge_t * eee,
             dest = find_peer_by_mac( eee->pending_peers, destMac );
         if ( dest && dest->compact_capable )
             use_compact = 1;
-        if ( !compact_dbg_logged && dest ) {
+        if ( !compact_dbg_logged ) {
             compact_dbg_logged = 1;
-            traceEvent(TRACE_NORMAL, "Peer %s compact_capable=%u -> %s format",
-                       macaddr_str((macstr_t){0}, dest->mac_addr),
-                       (unsigned)dest->compact_capable,
-                       use_compact ? "COMPACT" : "LEGACY");
-            (void)macaddr_str; /* suppress unused if traceEvent above macro expands differently */
+            if ( dest ) {
+                traceEvent(TRACE_NORMAL, "Peer %s compact_capable=%u -> %s format",
+                           macaddr_str((macstr_t){0}, dest->mac_addr),
+                           (unsigned)dest->compact_capable,
+                           use_compact ? "COMPACT" : "LEGACY");
+            } else {
+                traceEvent(TRACE_NORMAL, "Peer dest=%s unknown (not in tables yet) -> LEGACY format by default",
+                           macaddr_str((macstr_t){0}, destMac));
+            }
         }
     }
     PEERS_UNLOCK( eee );

@@ -441,6 +441,27 @@ struct n2n_edge
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
 
+#ifdef _WIN32
+    /* Windows P2P uplink token-bucket pacing.  Winsock SO_SNDBUF=8KB
+     *   gives us ~5 packets of kernel-level smoothing, but tunneled TCP
+     *   bursts still occasionally overflow the ISP-edge FIFO even when
+     *   the 5-packet buffer enforces back-pressure (i7-2720 wakes up
+     *   late and TCP has queued ~10+ frames through TAP into the user
+     *   thread).  A 48 Mbps hard-cap token bucket with 1 ms granularity
+     *   (timeBeginPeriod / timeGetTime) flattens this user-side burst
+     *   profile completely; at 48 Mbps the bucket comfortably sits
+     *   ABOVE the ~42 Mbps cnn2n baseline so we never cap the tunnel
+     *   short of its true achievable rate.
+     *
+     * Bytes refill at 6,000 bytes/ms (= 48 Mbps).  Bucket cap is 3 KB
+     *   (~2 packets) to guarantee no more than 2 frames hit the wire
+     *   back-to-back at any tick boundary.  Pacing is applied ONLY to
+     *   the P2P direct send path in send_PACKET; supernode relay,
+     *   keepalives and peer registrations are deliberately unpaced. */
+    uint32_t            tx_pace_bucket;        /* bytes available to send right now */
+    uint32_t            tx_pace_last_ms;       /* timeGetTime stamp at last refill */
+#endif
+
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
 #ifdef _WIN32
