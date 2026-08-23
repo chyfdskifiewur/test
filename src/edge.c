@@ -37,7 +37,9 @@
 #ifdef _WIN32
 #include <iphlpapi.h>
 #include <windns.h>
+#include <Mmsystem.h>       /* timeBeginPeriod / timeEndPeriod / timeGetTime */
 #pragma comment(lib, "dnsapi.lib")
+#pragma comment(lib, "winmm.lib")   /* multimedia timer for 1 ms token-bucket pacing */
 /* Interface types for filtering virtual interfaces */
 #ifndef IF_TYPE_PPP
 #define IF_TYPE_PPP 23
