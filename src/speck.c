@@ -224,9 +224,15 @@ int speck_expand_key (const unsigned char *k, speck_context_t *ctx) {
 }
 
 
-/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
- * always has SSSE3+ which is all the SSE path needs. */
-#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
+/* Keep MSVC on the pure-C speck path — aligned with speck.h and with cnn2n.
+ *   (cnn2n speck.c guards the SSE branch on __SSE4_2__ only; MSVC does not
+ *    define that macro even on x64 builds.)  Rationale: on Sandy Bridge
+ *   (i7-2720QM etc.), SSE SIMD is 30-40% slower than scalar C because any
+ *   AVX<->SSE transition elsewhere in the process (Winsock, NDIS, other
+ *   threads) triggers a ~60 cycle microcode state-save penalty on *every*
+ *   SIMD instruction — crushing per-packet encryption throughput for the
+ *   1338-byte packets we send at 2.6 kpps for 28 Mbps. */
+#elif defined (__SSE4_2__) // SSE support -------------------------------------------------
 
 
 #define LCS(x,r) (((x)<<r)|((x)>>(64-r)))
