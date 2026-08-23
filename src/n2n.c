@@ -76,11 +76,28 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
 #endif
 
 #ifdef _WIN32
-    /* Windows default UDP buffer is only 8KB, increase to 1MB for throughput */
+    /* Keep the receive path well-endowed (1 MB = good for bursts of ACKs
+     *   and P2P-peer forwarded data; this is what gave us 64 Mbps reverse
+     *   throughput and we must not touch it) but deliberately keep the
+     *   send path TIGHT.  Default Winsock UDP SNDBUF is only 8 KB and
+     *   cnn2n does not override it — their 42 Mbps is hit with that
+     *   tiny buffer.  When we bloated SO_SNDBUF to 1 MB we let the
+     *   application-layer TCP (running over TAP) push large bursts into
+     *   the kernel send queue; those micro-bursts then overflow the ISP
+     *   edge router's small FIFO on the uplink path, causing ~1-2%
+     *   random drops that the inner TCP interprets as congestion and
+     *   cuts cwnd so the tunnel tops out at ~28 Mbps.
+     *
+     * 64 KB is ~47 full-size (1428 B) frames, enough to smooth out
+     *   scheduler jitter on this 2nd-gen i7 while still forcing
+     *   sendto() to block (back-pressure) long before any per-second
+     *   buffering accumulates.  KCP bypass rate-limits itself so it
+     *   is equally happy with 64 KB as with 1 MB. */
     {
-        int bufsize = 1024 * 1024;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
-        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
+        int rcvsize = 1024 * 1024;
+        int sndsize = 64 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
     }
 #endif
 
@@ -168,11 +185,14 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
     setsockopt(sock_fd, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&sockopt, sizeof(sockopt));
 
 #ifdef _WIN32
-    /* Windows default UDP buffer is only 8KB, increase to match Linux (2MB) */
+    /* Match open_socket tuning (see there for detailed rationale): big
+     *   RCVBUF so inbound IPv6 does not drop, deliberately tight SNDBUF
+     *   so the uplink micro-bursts do not trigger ISP-side FIFO drops. */
     {
-        int bufsize = 2 * 1024 * 1024;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
-        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
+        int rcvsize = 2 * 1024 * 1024;
+        int sndsize = 64 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
     }
 #endif
 
