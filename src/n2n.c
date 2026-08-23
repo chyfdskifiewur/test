@@ -105,12 +105,14 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
 #ifdef _WIN32
         /* Windows default UDP rcvbuf is only 8-64KB, causing burst packet loss
          * when the main loop is briefly delayed (PEERS_LOCK, keepalive, etc.).
-         * Linux is already set to 2MB. Windows may silently reduce to a lower
-         * value if the requested size exceeds the system max, but 2MB is safe. */
+         * Request 2MB on all platforms (kernel may double it). Linux leaves
+         * SO_SNDBUF at ~200KB by default, which overflows on burst sends and,
+         * combined with the non-blocking socket, drops packets via EAGAIN. */
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&buf_sz, sizeof(buf_sz));
         setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&buf_sz, sizeof(buf_sz));
 #else
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
 #endif
     }
 

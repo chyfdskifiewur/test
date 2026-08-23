@@ -150,7 +150,7 @@ typedef struct route {
     uint8_t gateway[IPV6_SIZE];
 } route;
 
-#define N2N_MAX_TRANSFORMS      5
+#define N2N_MAX_TRANSFORMS      16
 
 /* N2N_IFNAMSIZ is needed on win32 even if dev_name is not used after declaration */
 #ifndef _WIN32

@@ -74,7 +74,7 @@
 #define MAX_CONFFILE_LINE_LENGTH        1024
 
 #define N2N_PATHNAME_MAXLEN             256
-#define N2N_MAX_TRANSFORMS              5
+#define N2N_MAX_TRANSFORMS              16
 #define N2N_EDGE_MGMT_PORT              5664
 
 /* Portable temporary buffer macros - avoids C99 compound literals which
@@ -2578,7 +2578,6 @@ static void send_packet2net(n2n_edge_t * eee,
     uint8_t pktbuf[N2N_PKT_BUF_SIZE];
     size_t idx=0;
     size_t tx_transop_idx=0;
-    n2n_trans_op_t * transop = NULL;
 
     ether_hdr_t eh;
 
@@ -2622,7 +2621,6 @@ static void send_packet2net(n2n_edge_t * eee,
 
     /* Once processed, send to destination in PACKET */
     tx_transop_idx = edge_choose_tx_transop( eee );
-    transop = &(eee->transop[tx_transop_idx]);   /* cache pointer to the active transop */
 
     /* Check if the destination peer supports compact format.
      * If unknown (first packet), send legacy and let the peer upgrade
@@ -2651,7 +2649,7 @@ static void send_packet2net(n2n_edge_t * eee,
         encode_compact_header( pktbuf, &idx, &cmn, destMac, NULL );
 
         traceEvent( TRACE_DEBUG, "encoded compact PACKET header of size=%u transform %u (idx=%u)",
-                    (unsigned int)idx, (unsigned int)transop->transform_id, (unsigned int)tx_transop_idx );
+                    (unsigned int)idx, (unsigned int)eee->transop[tx_transop_idx].transform_id, (unsigned int)tx_transop_idx );
     }
     else
     {
@@ -2664,19 +2662,19 @@ static void send_packet2net(n2n_edge_t * eee,
         memcpy( pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE );
         memcpy( pkt.dstMac, destMac, N2N_MAC_SIZE );
         pkt.sock.family = 0;
-        pkt.transform = transop->transform_id;
+        pkt.transform = eee->transop[tx_transop_idx].transform_id;
 
         idx=0;
         encode_PACKET( pktbuf, &idx, &cmn, &pkt );
 
         traceEvent( TRACE_DEBUG, "encoded legacy PACKET header of size=%u transform %u (idx=%u)",
-                    (unsigned int)idx, (unsigned int)transop->transform_id, (unsigned int)tx_transop_idx );
+                    (unsigned int)idx, (unsigned int)eee->transop[tx_transop_idx].transform_id, (unsigned int)tx_transop_idx );
     }
 
-    idx += transop->fwd( transop,
-                         pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
-                         tap_pkt, len, destMac );
-    ++(transop->tx_cnt); /* stats */
+    idx += eee->transop[tx_transop_idx].fwd( &(eee->transop[tx_transop_idx]),
+                                             pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
+                                             tap_pkt, len, destMac );
+    ++(eee->transop[tx_transop_idx].tx_cnt); /* stats */
 
     send_PACKET( eee, destMac, pktbuf, idx ); /* to peer or supernode */
 }
@@ -2958,7 +2956,6 @@ static int handle_PACKET( n2n_edge_t * eee,
                         n2n_common_t cmn;
                         n2n_PACKET_t pkt;
                         size_t tx_transop_idx = edge_choose_tx_transop(eee);
-                        n2n_trans_op_t *probe_op = &(eee->transop[tx_transop_idx]);
                         memcpy(destMac, eth_payload + 6, N2N_MAC_SIZE);
                         memset(&cmn, 0, sizeof(cmn));
                         cmn.ttl = N2N_DEFAULT_TTL;
@@ -2969,13 +2966,13 @@ static int handle_PACKET( n2n_edge_t * eee,
                         memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
                         memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
                         pkt.sock.family = 0;
-                        pkt.transform = probe_op->transform_id;
+                        pkt.transform = eee->transop[tx_transop_idx].transform_id;
                         encode_PACKET(pktbuf, &idx, &cmn, &pkt);
-                        idx += probe_op->fwd(
-                            probe_op,
+                        idx += eee->transop[tx_transop_idx].fwd(
+                            &(eee->transop[tx_transop_idx]),
                             pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
                             probe_ack, pa_len, destMac);
-                        ++(probe_op->tx_cnt);
+                        ++(eee->transop[tx_transop_idx].tx_cnt);
                         n2n_sock_t dest = *orig_sender;
                         sendto_sock(sock_for_dest(eee, &dest), pktbuf, idx, &dest);
                     }
@@ -6133,7 +6130,6 @@ static int run_loop(n2n_edge_t * eee )
                             n2n_common_t cmn;
                             n2n_PACKET_t pkt;
                             size_t tx_transop_idx = edge_choose_tx_transop(eee);
-                            n2n_trans_op_t *p2p_op = &(eee->transop[tx_transop_idx]);
                             memcpy(destMac, frame, N2N_MAC_SIZE);
                             memset(&cmn, 0, sizeof(cmn));
                             cmn.ttl = N2N_DEFAULT_TTL;
@@ -6144,13 +6140,13 @@ static int run_loop(n2n_edge_t * eee )
                             memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
                             memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
                             pkt.sock.family = 0;
-                            pkt.transform = p2p_op->transform_id;
+                            pkt.transform = eee->transop[tx_transop_idx].transform_id;
                             encode_PACKET(pktbuf, &idx, &cmn, &pkt);
-                            idx += p2p_op->fwd(
-                                p2p_op,
+                            idx += eee->transop[tx_transop_idx].fwd(
+                                &(eee->transop[tx_transop_idx]),
                                 pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
                                 frame, 19, destMac);
-                            ++(p2p_op->tx_cnt);
+                            ++(eee->transop[tx_transop_idx].tx_cnt);
                             /* Send directly to peer's P2P address */
                             sendto_sock(sock_for_dest(eee, &p2p_dest),
                                         pktbuf, idx, &p2p_dest);
