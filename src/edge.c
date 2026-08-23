@@ -784,22 +784,6 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
-
-    for( int retry = 0; retry < 50 && sent < 0; retry++ )
-    {
-#ifdef _WIN32
-        if( WSAGetLastError() != WSAEWOULDBLOCK )
-            break;
-        Sleep(1);
-#else
-        if( errno != EAGAIN && errno != EWOULDBLOCK )
-            break;
-        usleep(1000);
-#endif
-        sent = sendto( fd, buf, len, 0/*flags*/,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
-
     if ( sent < 0 )
     {
 #ifdef _WIN32
@@ -3559,6 +3543,16 @@ static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
     }
 
     i = sizeof(sender_sock);
+
+#ifdef _WIN32
+    {
+        unsigned long nread = 0;
+        if (ioctlsocket(fd, FIONREAD, &nread) == SOCKET_ERROR || nread == 0) {
+            return 0; /* nothing available -> UDP queue drained */
+        }
+    }
+#endif
+
     recvlen = recvfrom(fd, udp_buf, sizeof(udp_buf), 0/*flags*/,
                       (struct sockaddr*) &sender_sock, (socklen_t*) &i);
 
@@ -3566,16 +3560,14 @@ static int readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
     {
 #ifdef _WIN32
         int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK) {
-            W32_ERROR(err, c)
-            traceEvent( TRACE_DEBUG, "recvfrom failed [%d] %ls", err, c ? c : L"" );
-            W32_ERROR_FREE(c)
-        }
+        W32_ERROR(err, c)
+        traceEvent( TRACE_DEBUG, "recvfrom failed [%d] %ls", err, c ? c : L"" );
+        W32_ERROR_FREE(c)
 #else
         traceEvent(TRACE_DEBUG, "recvfrom failed with %s", strerror(errno) );
 #endif
 
-        return 0; /* failed to receive data from UDP — queue drained or error */
+        return 0; /* failed to receive data from UDP */
     }
 
     /* Determine sender address from socket family */
