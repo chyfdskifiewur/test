@@ -502,18 +502,24 @@ struct n2n_edge
     HANDLE              tap_tx_has_slot;   /* signalled after consumer pop */
     HANDLE              tap_tx_has_item;   /* signalled after producer push */
 
-    /* Windows main-loop uses WaitForMultipleObjects instead of select
-     *   because TAP fd can't enter select().  Two events:
-     *     [0] hUdpEvent        = WSAEventSelect on udp_sock + udp_sock6
-     *     [1] tap_tx_has_item  = tap_tx queue push wakes consumer.
-     *   Bypass sockets (KCP) continue to be polled via select(timeout=0)
-     *   after every WFMO wakeup — KCP ikcp_update natural cadence is
-     *   10 ms anyway so poll-once per wakeup introduces no extra lag. */
-#define N2N_WFMO_UDP_IDX       0
-#define N2N_WFMO_TX_ITEM_IDX   1
-#define N2N_WFMO_NUM_HANDLES   2
-    WSAEVENT            hUdpEvent;         /* UDP main sock FD_READ/FD_CLOSE
-                                            *   (IPv4 + IPv6 both attached) */
+    /* Windows main-loop uses WaitForSingleObject instead of select
+     *   because TAP fd can't enter select().  tap_tx_has_item is the
+     *   producer→consumer notification: tunReadThread signals it after
+     *   every push so the main loop drains the ring immediately.  The
+     *   wait uses a FIXED 10 ms timeout which covers three needs at
+     *   once:
+     *     (1) KCP's natural ikcp_update cadence is 100 Hz anyway,
+     *     (2) UDP RX / mgmt / WS / bypass TCP fds are polled via
+     *         select(timeout=0) after every wakeup, so 0-10 ms added
+     *         latency is invisible to ping,
+     *     (3) no dependency on WSAEventSelect — which silently sets
+     *         sockets to non-blocking mode and would destroy the
+     *         SO_SNDBUF blocking back-pressure the tap_tx ring relies
+     *         on for TCP cwnd auto-tuning.
+     *   Bounded ring + blocking sendto on a native blocking UDP socket
+     *   = the exact implicit back-pressure cnn2n achieves with its
+     *   single-threaded select loop. */
+#define N2N_WIN_TICK_MS   10
 #endif
 
     /* Rate-limiting for P2P/PsP log messages */
