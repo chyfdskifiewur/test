@@ -784,6 +784,35 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
+#ifdef _WIN32
+    /* Windows UDP send buffering is small and SO_SNDBUF is largely a no-op for
+     * connectionless sockets, so a burst from the TAP reader thread can overflow
+     * the send queue. On a non-blocking socket that makes sendto() return
+     * WSAEWOULDBLOCK and silently drop the datagram. Each drop forces a TCP
+     * retransmit plus congestion back-off, capping the forward (Windows->peer)
+     * direction well below line rate. Yield briefly and retry so the burst is
+     * absorbed instead of dropped; only give up after a bounded number of tries. */
+    if (sent < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
+    {
+        int tries;
+        for (tries = 0; tries < 8; ++tries)
+        {
+            Sleep(1);   /* let the kernel drain the UDP send queue */
+            sent = sendto(fd, buf, len, 0, (struct sockaddr*)&peer_addr, addr_len);
+            if (sent >= 0 || WSAGetLastError() != WSAEWOULDBLOCK)
+                break;
+        }
+        if (sent < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
+        {
+            /* Still blocked after every retry: count it (throttled log). */
+            static volatile LONG wb_drops = 0;
+            LONG n = InterlockedIncrement(&wb_drops);
+            if ((n & 0x3FF) == 0)
+                traceEvent(TRACE_WARNING,
+                           "UDP send still WSAEWOULDBLOCK after retry: ~%ld dropped", n);
+        }
+    }
+#endif
     if ( sent < 0 )
     {
 #ifdef _WIN32
