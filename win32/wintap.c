@@ -40,6 +40,22 @@ static int get_adapter_luid(PWSTR device_name, NET_LUID* luid) {
     return 0;
 }
 
+static uint32_t set_mtu(struct tuntap_dev* device) {
+    MIB_IPINTERFACE_ROW row;
+
+    InitializeIpInterfaceEntry(&row);
+    row.InterfaceLuid = device->luid;
+    row.Family = AF_INET;
+
+    if (GetIpInterfaceEntry(&row) != NO_ERROR)
+        return (uint32_t)-1;
+
+    row.NlMtu = device->mtu;
+    row.SitePrefixLength = 0;
+
+    return SetIpInterfaceEntry(&row);
+}
+
 static uint32_t set_dhcp(struct tuntap_dev* device) {
     wchar_t if_name[MAX_ADAPTER_NAME_LENGTH];
     /* lets hope that these are big enough */
@@ -140,39 +156,6 @@ static uint32_t set_static_routes(struct tuntap_dev* device) {
 
         rc |= CreateIpForwardEntry2(&route);
     }
-
-    return rc;
-}
-
-/* Set the TAP adapter MTU on Windows.
- *
- * tap-windows6 leaves the TAP MTU at 1500. n2n wraps every TAP frame in its own
- * PACKET header plus (with encryption) a transform header, so a full 1500-byte
- * payload exceeds the wire MTU and gets IP-fragmented. Linux avoids this because
- * its TAP MTU is DEFAULT_MTU (1350). Match Linux on Windows so the -M option
- * actually takes effect and the whole datagram stays below the wire MTU.
- * Requires elevation, which edge already needs to configure the TAP adapter. */
-static uint32_t set_interface_mtu(struct tuntap_dev *device, uint32_t mtu) {
-    MIB_IPINTERFACE_ROW ifrow;
-    DWORD rc;
-
-    InitializeIpInterfaceEntry(&ifrow);
-    ifrow.Family = AF_INET;
-    /* Use the LUID rather than ifIdx: the LUID is confirmed valid (it was used
-     * to create the unicast address), whereas ifIdx is only set opportunistically
-     * via ConvertInterfaceLuidToIndex. */
-    ifrow.InterfaceLuid = device->luid;
-
-    rc = GetIpInterfaceEntry(&ifrow);
-    if (rc != NO_ERROR) {
-        traceEvent(TRACE_WARNING, "GetIpInterfaceEntry for MTU failed (rc=%u)", rc);
-        return rc;
-    }
-
-    ifrow.NlMtu = mtu;
-    rc = SetIpInterfaceEntry(&ifrow);
-    if (rc != NO_ERROR)
-        traceEvent(TRACE_WARNING, "SetIpInterfaceEntry NlMtu=%u failed (rc=%u)", mtu, rc);
 
     return rc;
 }
@@ -327,6 +310,11 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
 
         tuntap_get_address(device);
 
+        if (set_mtu(device) == NO_ERROR)
+            traceEvent(TRACE_NORMAL, "Interface MTU set to %d", device->mtu);
+        else
+            traceEvent(TRACE_WARNING, "Unable to set interface MTU to %d", device->mtu);
+
         /* set driver media status to 'connected' */
         if (!DeviceIoControl(
             device->device_handle, TAP_WIN_IOCTL_SET_MEDIA_STATUS,
@@ -336,16 +324,6 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
             W32_ERROR(GetLastError(), error)
             traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls: %ls", adaptername, error);
             W32_ERROR_FREE(error)
-        }
-
-        /* Set MTU after the interface is up; SetIpInterfaceEntry fails with
-         * ERROR_INVALID_PARAMETER while the adapter is still disconnected. */
-        {
-            DWORD mtu_rc = set_interface_mtu(device, device->mtu);
-            if (mtu_rc != NO_ERROR)
-                traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
-            else
-                traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
         }
 
         /*
@@ -595,6 +573,11 @@ int tuntap_restart( tuntap_dev* device ) {
 
     tuntap_get_address(device);
 
+    if (set_mtu(device) == NO_ERROR)
+        traceEvent(TRACE_NORMAL, "Interface MTU set to %d", device->mtu);
+    else
+        traceEvent(TRACE_WARNING, "Unable to set interface MTU to %d", device->mtu);
+
     if (!DeviceIoControl(
         device->device_handle, TAP_WIN_IOCTL_SET_MEDIA_STATUS,
         &status, sizeof (status),
@@ -604,14 +587,6 @@ int tuntap_restart( tuntap_dev* device ) {
         traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls: %ls", device->device_name, error);
         W32_ERROR_FREE(error);
         return -1;
-    }
-
-    {
-        DWORD mtu_rc = set_interface_mtu(device, device->mtu);
-        if (mtu_rc != NO_ERROR)
-            traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
-        else
-            traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
     }
 
     /* Restart write thread after reopening device */
