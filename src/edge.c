@@ -2754,7 +2754,8 @@ static inline void process_tap_rx_frame(n2n_edge_t *eee,
     macstr_t mac_buf;
     const uint8_t *mac = buf;
 
-    if (len <= 0)
+    /* Defensive — never pass garbage down. */
+    if (!eee || !buf || len <= 0 || len > 1600)
         return;
 
     traceEvent(TRACE_DEBUG, "### Rx TAP packet (%4d) for %s",
@@ -2765,8 +2766,15 @@ static inline void process_tap_rx_frame(n2n_edge_t *eee,
         return;
     }
 
-    if (!bypass_has_peers(eee->bp) || bypass_tap_forward(eee->bp, (uint8_t*)buf, len) == 0)
+    /* bypass_has_peers already handles NULL ctx (returns 0).  The
+     *   || short-circuit guarantees bypass_tap_forward is never called
+     *   with a NULL ctx, but we guard it explicitly anyway so future
+     *   refactors of the condition can never accidentally null-deref. */
+    if (!bypass_has_peers(eee->bp) ||
+        (eee->bp && bypass_tap_forward(eee->bp, (uint8_t*)buf, len) == 0))
+    {
         send_packet2net(eee, (uint8_t*)buf, len);
+    }
 }
 
 /** Read a single packet from the TAP interface, process it and write out the
@@ -5925,19 +5933,31 @@ static int run_loop(n2n_edge_t * eee )
      *   driver's RX ring fills up and the user-space TCP that is
      *   writing to the TAP gets back-pressure automatically —
      *   zero parameters, fully auto-tuning to the real uplink
-     *   capacity just like cnn2n. */
+     *   capacity just like cnn2n.
+     *
+     *   Pre-submit the first overlapped read before entering the
+     *   loop, draining any synchronously-completed frames (driver
+     *   backlog on startup).  On any transient error we silently
+     *   skip; the per-tick lazy-init block inside the loop will
+     *   re-try the submission so we never get stuck with no IRP
+     *   in flight. */
+    if (eee->device.overlap_read.hEvent != NULL &&
+        eee->device.device_handle != INVALID_HANDLE_VALUE)
     {
-        /* Submit overlapped reads before entering the loop, draining
-         *   any frames that complete synchronously (backlog at startup
-         *   or very fast completions) so the IRP is guaranteed to be
-         *   in flight (read_pending != 0) when we enter WFSO. */
         ssize_t slen;
         while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-            process_tap_rx_frame(&eee, eee->device.read_buf, slen);
+            process_tap_rx_frame(eee, eee->device.read_buf, slen);
         }
-        /* Normal exit: slen == 0 → async IRP in flight, read_pending=1.
-         *   If slen < 0 (error), we still proceed; the first main-loop
-         *   wakeup will re-submit via the same re-try loop below. */
+        traceEvent(TRACE_NORMAL,
+                   "PlanB TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
+                   (unsigned)eee->device.read_pending, (int)slen);
+    }
+    else
+    {
+        traceEvent(TRACE_WARNING,
+                   "PlanB TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
+                   eee->device.overlap_read.hEvent,
+                   (void*)(UINT_PTR)eee->device.device_handle);
     }
 #endif
 
@@ -5954,6 +5974,12 @@ static int run_loop(n2n_edge_t * eee )
         fd_set socket_mask;
         struct timeval wait_time;
         time_t nowTime;
+        static int tick_count = 0;  /* diagnostic-only — never affects behaviour */
+        if (tick_count < 2) {
+            traceEvent(TRACE_NORMAL, "PlanB: main loop tick %d (keep_running=%d g_edge_running=%d)",
+                       tick_count + 1, keep_running, (int)g_edge_running);
+            ++tick_count;
+        }
 
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
@@ -6030,12 +6056,29 @@ static int run_loop(n2n_edge_t * eee )
          *            all I/O stays single-threaded. ---------- */
 #ifdef _WIN32
         {
-            /* Block for up to N2N_MAINLOOP_TICK_MS on the TAP read
-             *   completion event.  overlap_read.hEvent is manual-reset
-             *   so it stays signalled until we explicitly ResetEvent()
-             *   it after calling GetOverlappedResult. */
-            WaitForSingleObject(eee->device.overlap_read.hEvent,
-                                (DWORD)N2N_MAINLOOP_TICK_MS);
+            HANDLE h_evt = eee->device.overlap_read.hEvent;
+            BOOL tap_evt_valid = (h_evt != NULL);
+
+            if (tap_evt_valid) {
+                /* Block for up to N2N_MAINLOOP_TICK_MS on the TAP read
+                 *   completion event.  overlap_read.hEvent is manual-reset
+                 *   so it stays signalled until we explicitly ResetEvent()
+                 *   it after calling GetOverlappedResult. */
+                WaitForSingleObject(h_evt, (DWORD)N2N_MAINLOOP_TICK_MS);
+            } else {
+                /* Fallback — event handle missing (tuntap_open failed to
+                 *   create it).  Poll at the fixed tick cadence; TAP RX
+                 *   won't work but the rest stays alive and we keep
+                 *   trying to re-prime the reader below so a tuntap
+                 *   restart can recover.  Rate-limit the warning so
+                 *   we don't flood the log. */
+                static unsigned warn_suppress = 0;
+                if (warn_suppress == 0)
+                    traceEvent(TRACE_WARNING,
+                               "PlanB: no overlap_read event, polling-only mode");
+                warn_suppress = (warn_suppress + 1) & 0xFFu;
+                Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
+            }
 
             /* If an overlapped TAP read was in flight and the event
              *   fired, harvest the result now. */
