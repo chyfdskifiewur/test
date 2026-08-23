@@ -92,10 +92,18 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
      *   scheduler jitter on this 2nd-gen i7 while still forcing
      *   sendto() to block (back-pressure) long before any per-second
      *   buffering accumulates.  KCP bypass rate-limits itself so it
-     *   is equally happy with 64 KB as with 1 MB. */
+     *   is equally happy with 64 KB as with 1 MB.
+     *
+     * UPDATE: 64 KB still left a ~10 Mbps gap vs cnn2n on the same
+     *   machine (42 vs 32 Mbps P2P uplink).  cnn2n NEVER sets SNDBUF
+     *   at all, so its UDP sockets run at the Winsock default of
+     *   ~8 KB (confirmed via getsockopt).  Therefore close the last
+     *   8x gap and go to 8 KB: only ~5 full-size frames in flight,
+     *   back-pressure fires every ~1.5 ms at 42 Mbps which exactly
+     *   flattens every microburst so the ISP FIFO never drops. */
     {
         int rcvsize = 1024 * 1024;
-        int sndsize = 64 * 1024;
+        int sndsize = 8 * 1024;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
         setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
     }
@@ -197,10 +205,12 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
 #ifdef _WIN32
     /* Match open_socket tuning (see there for detailed rationale): big
      *   RCVBUF so inbound IPv6 does not drop, deliberately tight SNDBUF
-     *   so the uplink micro-bursts do not trigger ISP-side FIFO drops. */
+     *   so the uplink micro-bursts do not trigger ISP-side FIFO drops.
+     *   8 KB = cnn2n Winsock default (cnn2n never calls setsockopt on
+     *   SNDBUF; 64 KB still showed a 10 Mbps shortfall at 32 vs 42). */
     {
         int rcvsize = 2 * 1024 * 1024;
-        int sndsize = 64 * 1024;
+        int sndsize = 8 * 1024;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvsize, sizeof(rcvsize));
         setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&sndsize, sizeof(sndsize));
     }

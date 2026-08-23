@@ -2666,6 +2666,7 @@ static void send_packet2net(n2n_edge_t * eee,
      * If unknown (first packet), send legacy and let the peer upgrade
      * opportunistically when it responds with a compact packet. */
     int use_compact = 0;
+    static int compact_dbg_logged = 0;
     PEERS_LOCK( eee );
     {
         struct peer_info *dest = find_peer_by_mac( eee->known_peers, destMac );
@@ -2673,6 +2674,14 @@ static void send_packet2net(n2n_edge_t * eee,
             dest = find_peer_by_mac( eee->pending_peers, destMac );
         if ( dest && dest->compact_capable )
             use_compact = 1;
+        if ( !compact_dbg_logged && dest ) {
+            compact_dbg_logged = 1;
+            traceEvent(TRACE_NORMAL, "Peer %s compact_capable=%u -> %s format",
+                       macaddr_str((macstr_t){0}, dest->mac_addr),
+                       (unsigned)dest->compact_capable,
+                       use_compact ? "COMPACT" : "LEGACY");
+            (void)macaddr_str; /* suppress unused if traceEvent above macro expands differently */
+        }
     }
     PEERS_UNLOCK( eee );
 
