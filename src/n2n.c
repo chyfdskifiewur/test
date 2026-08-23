@@ -57,14 +57,8 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
     {
-        /* PlanB: socket stays in BLOCKING mode.
-         *   Non-blocking (FIONBIO) causes sendto to return
-         *   WSAEWOULDBLOCK on a full buffer, triggering the coarse
-         *   Sleep(1) retry loop (~3ms per sleep) in send_packet2net,
-         *   which destroys throughput (28 Mbps vs 42 Mbps with
-         *   blocking mode).  Blocking sendto = natural backpressure,
-         *   matching cnn2n's approach.  select(timeout=0) for
-         *   readability polling works identically on blocking sockets. */
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
         /* Prevent WSAECONNRESET error spam on Windows when ICMP
          * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;
@@ -146,8 +140,10 @@ SOCKET open_socket6(uint16_t local_port, int bind_any) {
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
     {
-        /* PlanB: socket stays in BLOCKING mode (same rationale as
-         *   open_socket — see above). */
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* Prevent WSAECONNRESET error spam on Windows when ICMP
+         * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;
         BOOL newBehavior = FALSE;
         WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),

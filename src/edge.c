@@ -790,7 +790,20 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 #ifdef _WIN32
         if( WSAGetLastError() != WSAEWOULDBLOCK )
             break;
-        Sleep(1);
+        {
+            /* Wait for the socket to become writable (buffer drains) instead
+             * of Sleep(1) which has ~3ms granularity on Windows.  select
+             * with a 0.5ms timeout wakes up as soon as the kernel has freed
+             * buffer space — no wasted wall time.  If the timeout expires
+             * before the socket is writable, we just retry sendto anyway. */
+            fd_set wset;
+            struct timeval tv;
+            FD_ZERO(&wset);
+            FD_SET(fd, &wset);
+            tv.tv_sec  = 0;
+            tv.tv_usec = 500;
+            select(0, NULL, &wset, NULL, &tv);
+        }
 #else
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
