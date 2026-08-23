@@ -501,6 +501,19 @@ struct n2n_edge
     volatile unsigned   tap_tx_tail;       /* consumer read index (mod size) */
     HANDLE              tap_tx_has_slot;   /* signalled after consumer pop */
     HANDLE              tap_tx_has_item;   /* signalled after producer push */
+
+    /* Windows main-loop uses WaitForMultipleObjects instead of select
+     *   because TAP fd can't enter select().  Two events:
+     *     [0] hUdpEvent        = WSAEventSelect on udp_sock + udp_sock6
+     *     [1] tap_tx_has_item  = tap_tx queue push wakes consumer.
+     *   Bypass sockets (KCP) continue to be polled via select(timeout=0)
+     *   after every WFMO wakeup — KCP ikcp_update natural cadence is
+     *   10 ms anyway so poll-once per wakeup introduces no extra lag. */
+#define N2N_WFMO_UDP_IDX       0
+#define N2N_WFMO_TX_ITEM_IDX   1
+#define N2N_WFMO_NUM_HANDLES   2
+    WSAEVENT            hUdpEvent;         /* UDP main sock FD_READ/FD_CLOSE
+                                            *   (IPv4 + IPv6 both attached) */
 #endif
 
     /* Rate-limiting for P2P/PsP log messages */

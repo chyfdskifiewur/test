@@ -352,6 +352,12 @@ static int edge_init(n2n_edge_t * eee)
                                        FALSE, /* auto-reset */
                                        FALSE, /* initial state = non-signalled */
                                        NULL);
+    /* WSA events for WaitForMultipleObjects main loop (replace select).
+     *   UDP primary sockets attach to hUdpEvent; tap_tx queue signals
+     *   tap_tx_has_item directly. Bypass/KCP polled after every wakeup
+     *   via select(timeout=0); KCP's own 10 ms ikcp_update cadence
+     *   matches the minimum WFMO timeout anyway. */
+    eee->hUdpEvent = WSACreateEvent();
 #endif
     eee->start_time = n2n_now();
 
@@ -523,8 +529,27 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
         traceEvent(TRACE_ERROR, "Failed to bind main UDP port %u", (signed int)local_port);
         return -1;
     }
+#ifdef _WIN32
+    /* Attach hUdpEvent — WSAEnumNetworkEvents will tell us which fd bits
+     *   are ready in the main loop's WaitForMultipleObjects dispatcher. */
+    if (eee->hUdpEvent && eee->hUdpEvent != WSA_INVALID_EVENT) {
+        WSAEventSelect(eee->udp_sock, eee->hUdpEvent,
+                       FD_READ | FD_CLOSE | FD_ACCEPT);
+    }
+#endif
 
     eee->udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
+#ifdef _WIN32
+    if (eee->udp_sock6 != -1 &&
+        eee->hUdpEvent && eee->hUdpEvent != WSA_INVALID_EVENT) {
+        /* IPv6 and IPv4 share the same WFMO event slot: signal on either
+         *   socket's RX is sufficient, the dispatcher below checks both by
+         *   walking fd sets (it just iterates both fds draining data), so
+         *   one event for both is simpler and keeps handle count 3. */
+        WSAEventSelect(eee->udp_sock6, eee->hUdpEvent,
+                       FD_READ | FD_CLOSE | FD_ACCEPT);
+    }
+#endif
     
     int has_ipv4 = (eee->udp_sock != -1);
     int has_ipv6 = 0;
@@ -714,16 +739,15 @@ static void edge_deinit(n2n_edge_t * eee)
 
 #ifdef _WIN32
     /* Shutdown sequence for tap_tx ring + tunReadThread:
-     *   1. keep_running = 0 (set by the caller before edge_term runs —
-     *      tap_tx_queue_push already checks it and bails out early).
-     *   2. If tunReadThread is currently BLOCKED on tap_tx_has_slot
-     *      (ring was full when shutdown initiated), it would never wake
-     *      without this manual SetEvent.  Similarly, signalling
-     *      tap_tx_has_item is harmless but keeps the drain symmetry.
-     *   3. Join the thread.  Timeout 1 s just in case tuntap_read is
-     *      stuck inside an ioctl — don't deadlock the process exit.
-     *   4. Close event handles (after join so no thread uses them).
-     *   5. Then the regular peers_lock / WSACleanup cleanup runs. */
+     *   1. keep_running = 0 — tap_tx_queue_push's loop guard exits.
+     *   2. Signal BOTH tap_tx events: tunReadThread may be blocked on
+     *      tap_tx_has_slot (ring was full at shutdown); signalling
+     *      wakes it immediately.
+     *   3. Join the thread (timeout 1 s: tuntap_read may be stuck in
+     *      an NDIS ioctl and never return — don't deadlock exit).
+     *   4. Clean up kernel events.
+     *   5. WSA events (order doesn't matter relative to tap_tx events
+     *      but cleanup after thread so no concurrent reference). */
     eee->keep_running = 0;
     SetEvent(eee->tap_tx_has_slot);
     SetEvent(eee->tap_tx_has_item);
@@ -734,6 +758,7 @@ static void edge_deinit(n2n_edge_t * eee)
     }
     if (eee->tap_tx_has_slot) { CloseHandle(eee->tap_tx_has_slot); eee->tap_tx_has_slot = NULL; }
     if (eee->tap_tx_has_item) { CloseHandle(eee->tap_tx_has_item); eee->tap_tx_has_item = NULL; }
+    if (eee->hUdpEvent)    { WSACloseEvent(eee->hUdpEvent);    eee->hUdpEvent = WSA_INVALID_EVENT; }
     WSACleanup();
     DeleteCriticalSection(&eee->peers_lock);
 #endif
@@ -2340,6 +2365,16 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
                 eee->udp_sock  = open_socket(eee->local_port, 1);
                 eee->udp_sock6 = open_socket6(eee->local_port, 1);
+#ifdef _WIN32
+                if (eee->hUdpEvent && eee->hUdpEvent != WSA_INVALID_EVENT) {
+                    if (eee->udp_sock != -1)
+                        WSAEventSelect(eee->udp_sock, eee->hUdpEvent,
+                                       FD_READ | FD_CLOSE | FD_ACCEPT);
+                    if (eee->udp_sock6 != -1)
+                        WSAEventSelect(eee->udp_sock6, eee->hUdpEvent,
+                                       FD_READ | FD_CLOSE | FD_ACCEPT);
+                }
+#endif
                 traceEvent(TRACE_NORMAL, "Supernode unreachable and no local traffic: re-opened UDP sockets");
             }
         }
@@ -6019,9 +6054,9 @@ static int run_loop(n2n_edge_t * eee )
     {
         int rc, max_sock = 0;
         fd_set socket_mask;
-        struct timeval wait_time;
         time_t nowTime;
 
+        /* ---------- (1) Build FD sets (identical across platforms) ---------- */
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
         max_sock = (int) eee->udp_sock;
@@ -6068,32 +6103,65 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
 
-        wait_time.tv_sec = SOCKET_TIMEOUT_INTERVAL_SECS; wait_time.tv_usec = 0;
-        /* When KCP connections are active, use 10ms select timeout
-         * for responsive KCP updates (ikcp_update every 10ms). */
+        /* ---------- (2) Timeout — dictated purely by protocol needs.
+         *   KCP needs ikcp_update every ~10 ms; otherwise the normal
+         *   1 s heartbeat cadence is plenty.  No magic numbers tuned
+         *   to a specific bandwidth scenario. ---------- */
+        unsigned long tick_ms;
         if (bypass_has_kcp_conns(eee->bp)) {
-            wait_time.tv_sec = 0;
-            wait_time.tv_usec = 10000;  /* 10ms */
+            tick_ms = 10;   /* KCP natural update cadence (100 Hz) */
+        } else {
+            tick_ms = SOCKET_TIMEOUT_INTERVAL_SECS * 1000UL;   /* default 1 s */
         }
+
+        /* ---------- (3) Wait + poll dispatch.
+         *   Windows: WFMO blocks on [hUdpEvent, tap_tx_has_item].
+         *            Returns on UDP RX, TAP-tx push, or timeout.
+         *            Then use select(timeout=0) to walk ALL fds with
+         *            the exact same POSIX logic as Linux — mgmt/WS/
+         *            bypass TCP fds don't need WSA events because
+         *            they're always covered by the zero-timeout poll.
+         *   Linux:   plain select with the real timeout — TAP fd is
+         *            already in the set so no extra wakeup is needed.
+         *   Both paths drain tap_tx (Windows) or read TAP directly
+         *   (Linux) after every wakeup so no packet ever sits in a
+         *   queue longer than one tick. ---------- */
 #ifdef _WIN32
-        else {
-            /* No KCP: default SOCKET_TIMEOUT_INTERVAL_SECS (= 1 s) is
-             *   too long for the tap_tx ring drain that runs AFTER
-             *   select returns.  50 ms gives a 20 Hz drain cadence,
-             *   which combined with the ring's 8-packet depth delivers
-             *   one wakeup per ~400 microseconds at 42 Mbps — so the
-             *   main loop is never idle for long when there are
-             *   packets to send, and it never spin-waits on the
-             *   producer either (the has_item event acts as the
-             *   producer-to-consumer notification edge case if ever
-             *   we need to beat the 50 ms tick). */
-            wait_time.tv_sec = 0;
-            wait_time.tv_usec = 50000;  /* 50 ms */
+        {
+            HANDLE wh[N2N_WFMO_NUM_HANDLES];
+            wh[N2N_WFMO_UDP_IDX]     = eee->hUdpEvent;
+            wh[N2N_WFMO_TX_ITEM_IDX] = eee->tap_tx_has_item;
+            DWORD wr = WaitForMultipleObjects(N2N_WFMO_NUM_HANDLES, wh,
+                                              FALSE, (DWORD)tick_ms);
+            /* UDP manual-reset event must be explicitly acked via
+             *   WSAEnumNetworkEvents; otherwise it stays signalled
+             *   forever and WFMO becomes a pure spin-loop. */
+            if (wr == WAIT_OBJECT_0 + N2N_WFMO_UDP_IDX) {
+                WSANETWORKEVENTS _ne;
+                /* Either v4 or v6 sock works for the ack — both are
+                 *   attached to the same event object. */
+                if (eee->udp_sock != -1)
+                    WSAEnumNetworkEvents(eee->udp_sock,  eee->hUdpEvent, &_ne);
+                else if (eee->udp_sock6 != -1)
+                    WSAEnumNetworkEvents(eee->udp_sock6, eee->hUdpEvent, &_ne);
+            }
+            /* Zero-timeout poll walks every fd using the same code
+             *   path as Linux.  Cheap and completely generic. */
+            struct timeval zt;
+            zt.tv_sec = 0; zt.tv_usec = 0;
+            rc = select(max_sock + 1, &socket_mask,
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
+        }
+#else
+        {
+            struct timeval wait_time;
+            wait_time.tv_sec  = tick_ms / 1000UL;
+            wait_time.tv_usec = (tick_ms % 1000UL) * 1000UL;
+            rc = select(max_sock + 1, &socket_mask,
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
         }
 #endif
-
-        rc = select(max_sock+1, &socket_mask, bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
-        nowTime=n2n_now();
+        nowTime = n2n_now();
 
         /* Handle signal interruption */
         if (rc < 0) {
@@ -6195,20 +6263,20 @@ static int run_loop(n2n_edge_t * eee )
         /* Finished processing select data. */
 
 #ifdef _WIN32
-        /* Drain the tap_tx ring: every main-loop tick we pop all queued
-         *   TAP frames and push them through send_packet2net.  Because
-         *   send_packet2net → sendto_sock is on a BLOCKING UDP socket
-         *   (SO_SNDBUF 8 KB), any back-pressure from the kernel UDP
-         *   buffer will stall send_packet2net here → drain pauses →
-         *   the ring stays partially full → tunReadThread is blocked
-         *   → TAP stops being drained → inner TCP writes to the TAP
-         *   device start blocking → TCP auto-tunes its cwnd to match
-         *   the actual UDP uplink bandwidth PERFECTLY.  No rate
-         *   parameters required — this is how cnn2n does it implicitly
-         *   via its single-threaded select loop; we replicate it here
-         *   without touching the Windows TAP fd model.
-         *
-         * Up to TAP_TX_RING_SIZE items per tick (exactly one ring). */
+        /* Drain the tap_tx ring after EVERY main-loop wakeup, regardless
+         *   of whether WFMO returned on tap_tx_has_item, hUdpEvent, or
+         *   timeout.  send_packet2net → sendto_sock sits on a BLOCKING
+         *   UDP socket (SO_SNDBUF ≈ 8 KB) so kernel-level back-pressure
+         *   stalls this drain exactly when uplink is saturated.  That in
+         *   turn keeps the ring partially full → tunReadThread blocks
+         *   waiting for has_slot → the TAP device read queue backs up →
+         *   the inner TCP sender writing to TAP observes reduced window
+         *   and auto-tunes its cwnd to the real UDP uplink capacity.
+         *   No hand-tuned rate parameters are required — this is the
+         *   same implicit back-pressure the cnn2n single-threaded loop
+         *   achieves naturally, reproduced here without changing the
+         *   Windows TAP fd/thread model.
+         * Up to TAP_TX_RING_SIZE items per tick (one full ring depth). */
         {
             uint8_t  pkt_copy[TAP_TX_SLOT_BYTES];
             uint32_t pkt_len;
