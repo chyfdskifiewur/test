@@ -123,11 +123,21 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
         return -1;
     }
 
-    /* Leave IP_TOS at the OS default (0 = Best Effort). The original n2n set
-     * 0x10 (DSCP CS1), which some carrier QoS policies classify as low-priority
-     * and rate-limit, capping tunnel throughput well below line rate (~53 Mbps
-     * vs ~82 Mbps for the same link). A null DSCP avoids that classification. */
+    /* DSCP / TOS handling: the setsockopt(IP_TOS) path MUST be skipped on
+     *   Windows.  cnn2n does NOT make this call at all and gets 42 Mbps on
+     *   the same link; our call here — regardless of whether we pass 0 or
+     *   0x10 — causes the Windows TC / qWAVE subsystem to permanently
+     *   CLASSIFY the socket's 5-tuple into a DSCP-aware QoS flow (the
+     *   Winsock API returns success but the actual DSCP mark is ignored;
+     *   the HARM is entering the QoS scheduler instead of the default
+     *   Best Effort path).  On ADSL/FTTH links with carrier DPI this
+     *   consistently pins the tunnel uplink at ~28 Mbps while identical
+     *   non-QoS-classified sockets (cnn2n, default browser UDP flows)
+     *   run at 40-45 Mbps.  Linux still needs the explicit 0 because
+     *   the original upstream defaulted to 0x10 (DSCP CS1) there. */
+#ifndef _WIN32
     { int tos = 0; setsockopt(sock_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)); }
+#endif
     {
         int buf_sz = 2 * 1024 * 1024;  /* 2MB */
 #ifdef _WIN32
