@@ -156,19 +156,25 @@ static uint32_t set_interface_mtu(struct tuntap_dev *device, uint32_t mtu) {
     MIB_IPINTERFACE_ROW ifrow;
     DWORD rc;
 
-    if (device->ifIdx == NET_IFINDEX_UNSPECIFIED)
-        return ERROR_INVALID_PARAMETER;
-
     InitializeIpInterfaceEntry(&ifrow);
     ifrow.Family = AF_INET;
-    ifrow.InterfaceIndex = device->ifIdx;
+    /* Use the LUID rather than ifIdx: the LUID is confirmed valid (it was used
+     * to create the unicast address), whereas ifIdx is only set opportunistically
+     * via ConvertInterfaceLuidToIndex. */
+    ifrow.InterfaceLuid = device->luid;
 
     rc = GetIpInterfaceEntry(&ifrow);
-    if (rc != NO_ERROR)
+    if (rc != NO_ERROR) {
+        traceEvent(TRACE_WARNING, "GetIpInterfaceEntry for MTU failed (rc=%u)", rc);
         return rc;
+    }
 
     ifrow.NlMtu = mtu;
-    return SetIpInterfaceEntry(&ifrow);
+    rc = SetIpInterfaceEntry(&ifrow);
+    if (rc != NO_ERROR)
+        traceEvent(TRACE_WARNING, "SetIpInterfaceEntry NlMtu=%u failed (rc=%u)", mtu, rc);
+
+    return rc;
 }
 
 int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
@@ -321,14 +327,6 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
 
         tuntap_get_address(device);
 
-        {
-            DWORD mtu_rc = set_interface_mtu(device, device->mtu);
-            if (mtu_rc != NO_ERROR)
-                traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
-            else
-                traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
-        }
-
         /* set driver media status to 'connected' */
         if (!DeviceIoControl(
             device->device_handle, TAP_WIN_IOCTL_SET_MEDIA_STATUS,
@@ -338,6 +336,16 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
             W32_ERROR(GetLastError(), error)
             traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls: %ls", adaptername, error);
             W32_ERROR_FREE(error)
+        }
+
+        /* Set MTU after the interface is up; SetIpInterfaceEntry fails with
+         * ERROR_INVALID_PARAMETER while the adapter is still disconnected. */
+        {
+            DWORD mtu_rc = set_interface_mtu(device, device->mtu);
+            if (mtu_rc != NO_ERROR)
+                traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
+            else
+                traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
         }
 
         /*
@@ -587,14 +595,6 @@ int tuntap_restart( tuntap_dev* device ) {
 
     tuntap_get_address(device);
 
-    {
-        DWORD mtu_rc = set_interface_mtu(device, device->mtu);
-        if (mtu_rc != NO_ERROR)
-            traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
-        else
-            traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
-    }
-
     if (!DeviceIoControl(
         device->device_handle, TAP_WIN_IOCTL_SET_MEDIA_STATUS,
         &status, sizeof (status),
@@ -604,6 +604,14 @@ int tuntap_restart( tuntap_dev* device ) {
         traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls: %ls", device->device_name, error);
         W32_ERROR_FREE(error);
         return -1;
+    }
+
+    {
+        DWORD mtu_rc = set_interface_mtu(device, device->mtu);
+        if (mtu_rc != NO_ERROR)
+            traceEvent(TRACE_WARNING, "Unable to set TAP MTU %u (rc=%u)", device->mtu, mtu_rc);
+        else
+            traceEvent(TRACE_NORMAL, "TAP MTU set to %u", device->mtu);
     }
 
     /* Restart write thread after reopening device */
