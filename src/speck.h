@@ -14,9 +14,11 @@ typedef struct {
     u256 rk[34];
     u64 key[34];
 } speck_context_t;
-/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
- * always has SSSE3+ which is all the SSE path needs. */
-#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
+/* SSE path is GCC/Clang-only. On Windows MSVC this 128-bit SIMD Speck measured
+ * SLOWER than the plain-C scalar path: forward dropped to ~28 Mbps with -A5 vs
+ * ~46 Mbps with -A1. Let MSVC fall through to plain C below, which uses direct
+ * u64* casts on x86 and matches the (proven-faster) Linux GCC build. */
+#elif defined (__SSE4_2__) // SSE support (GCC/Clang only) -------------------------------------------------
 #define SPECK_ALIGNED_CTX 16
 #define SPECK_CTX_BYVAL 1
 #include <immintrin.h>
