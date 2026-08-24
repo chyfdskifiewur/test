@@ -225,15 +225,8 @@ int speck_expand_key (const unsigned char *k, speck_context_t *ctx) {
 
 
 /* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
- * always has SSSE3+ which is all the SSE path needs.
- *
- * EXPERIMENT 2026-08-24: SSE branch disabled to align Speck with ChaCha20 plain-C.
- * ChaCha20 SSE2/SSSE3 implementation is small (32-bit SIMD); Speck SSE4.2 implementation
- * is larger (64-bit SIMD). On i7-2722 (Westmere), the SSE4.2 path may be slower than
- * plain-C due to L1-cache pressure from 128-bit ops on a 32KB L1D. By disabling this
- * branch, Windows falls back to NEON (no) / plain-C.
- * To re-enable: restore the trigger condition below. */
-#elif 0 && (defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64)) // SSE support -------------------------------------------------
+ * always has SSSE3+ which is all the SSE path needs. */
+#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
 
 
 #define LCS(x,r) (((x)<<r)|((x)>>(64-r)))
