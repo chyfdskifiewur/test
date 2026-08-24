@@ -212,7 +212,14 @@ struct tuntap_config {
  * same value if they are to understand each other. */
 #define N2N_COMPRESSION_ENABLED 1
 
-#define DEFAULT_MTU   1350
+/* MTU budget for the LARGEST transform (Speck, +17B preamble) must stay
+ * within the common 1400-byte path MTU (CGNAT / tunnelled links):
+ *   10 (compact hdr) + 17 (Speck IV) + MTU + 28 (IP+UDP) <= 1400
+ *   -> MTU <= 1345; use 1328 (same value cnn2n ships, proven at 52 Mbps
+ *   with Speck on this network).  At 1350 the Speck datagram is exactly
+ * 1405 > 1400 -> IP fragmentation -> single-stream TCP collapses to
+ * ~31 Mbps while A1 (no crypto, 1388 bytes) stays at ~50. */
+#define DEFAULT_MTU   1328
 
 /** Common type used to hold stringified IP addresses. */
 typedef char ipstr_t[INET6_ADDRSTRLEN];
@@ -272,11 +279,14 @@ typedef struct n2n_edge         n2n_edge_t;
  *         polled via select(timeout=0) after every wakeup, so worst-case
  *         0-10 ms extra ingress latency — completely invisible to
  *         interactive ping (RTT >> 10 ms on any real WAN link),
- *     (3) Windows side avoids WSAEventSelect entirely — that WinSock
- *         function silently flips UDP sockets to non-blocking mode,
- *         which would destroy the SO_SNDBUF-based implicit back-pressure
- *         the single-threaded send_packet2net path relies on to auto-tune
- *         TCP cwnd to the actual uplink bandwidth with zero parameters.
+ *     (3) Windows side binds FD_READ of the UDP socket to a WSA event and
+ *         blocks in WaitForMultipleObjects on [TAP overlapped completion,
+ *         UDP event] with this timeout as upper bound: idle CPU = 0,
+ *         wakeup latency = 0 for the two hot sources.  WSAEventSelect's
+ *         implicit switch to non-blocking mode is harmless here because
+ *         open_socket() already sets FIONBIO and sendto() drops on
+ *         WSAEWOULDBLOCK by design (TCP retransmits recover).  All other
+ *         fds are still polled by select(timeout=0) after each wakeup.
  *   Same value at every bandwidth, peer count, and operating system —
  *   fully generic, no scenario-specific tuning required. */
 #define N2N_MAINLOOP_TICK_MS    10

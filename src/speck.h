@@ -14,9 +14,18 @@ typedef struct {
     u256 rk[34];
     u64 key[34];
 } speck_context_t;
-/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
- * always has SSSE3+ which is all the SSE path needs. */
-#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
+/* SSE intrinsic path ONLY for GCC/Clang (__SSE4_2__ via -msse4.2).
+ * MSVC x64 (_M_AMD64/_M_X64) deliberately does NOT take this path:
+ *   (1) it defines SPECK_CTX_BYVAL, so every speck_ctr() call copies the
+ *       816-byte context (34x__m128i + 34xu64) onto the stack by value,
+ *       while the pure C path passes a 272-byte context by pointer;
+ *   (2) MSVC compiles the shuffle-heavy intrinsics (ROR8/ROL8 via
+ *       _mm_shuffle_epi8) measurably worse than GCC.
+ * Empirical: with -A1 (no crypto) forward = ~50 Mbps, with MSVC-SSE Speck
+ * = 33 Mbps; the pure C scalar path sustains 64 Mbps decrypt on the same
+ * i7-2720 (proven earlier).  cnn2n's Windows build uses the pure C path
+ * too and reaches 52 Mbps WITH Speck. */
+#elif defined (__SSE4_2__) // SSE support (GCC/Clang only — see comment above) -------------------------------------------------
 #define SPECK_ALIGNED_CTX 16
 #define SPECK_CTX_BYVAL 1
 #include <immintrin.h>
