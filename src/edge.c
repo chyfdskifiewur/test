@@ -824,6 +824,7 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
                            (struct sockaddr*) &peer_addr, addr_len );
         }
 #endif
+    } /* end of first if (sent<0) — fall through to the second */
 
     if ( sent < 0 )
     {
