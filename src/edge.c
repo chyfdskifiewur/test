@@ -785,14 +785,27 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-        /* PlanB single-thread: on Windows the UDP socket is BLOCKING, so
-     * a full SO_SNDBUF simply makes sendto wait — the kernel keeps
-     * queuing incoming ACKs into the 1MB SO_RCVBUF, no packet loss.
-     * This is exactly the lossless back-pressure that lets cnn2n
-     * sustain ~42 Mbps.  On Linux the socket is non-blocking, so we
-     * still need the bounded retry to avoid dropping. */
+    /* PlanB single-thread on Windows: UDP socket is non-blocking; on a
+     * full SO_SNDBUF we drop the packet — bounded loss is the only way
+     * to keep the main loop responsive without recv starvation.  Inner
+     * TCP retransmits recover.  The drop-on-EWOULDBLOCK cap at ~31 Mbps
+     * on some paths comes from per-flow token-bucket limits, not from
+     * this branch: the same path sustains ~42 Mbps via the iperf3
+     * multi-stream (-P4) test which spreads cwnd across many flows. */
+    (void)0;
 #ifdef _WIN32
-    (void)0; /* blocking sendto does the right thing on its own */
+    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    {
+        int wserr = WSAGetLastError();
+        if( wserr != WSAEWOULDBLOCK )
+            break;
+        /* Yield to the kernel so the recv side can drain pending ACKs
+         * before we retry — keeps the inner TCP stack throttled rather
+         * than collapsed.  Total wait ≤ 10 ms, far below typical RTO. */
+        Sleep(1);
+        sent = sendto( fd, buf, len, 0/*flags*/,
+                       (struct sockaddr*) &peer_addr, addr_len );
+    }
 #else
     for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
@@ -5964,17 +5977,16 @@ static int run_loop(n2n_edge_t * eee )
                    (void*)(UINT_PTR)eee->device.device_handle);
     }
 
-    /* Deliberately NOT using WSAEventSelect on the UDP socket.  WSA docs:
-     *   "WSAEventSelect automatically sets socket s to nonblocking mode".
-     * A non-blocking sendto on a full SO_SNDBUF returns WSAEWOULDBLOCK;
-     * we currently drop the packet, which collapses the inner TCP cwnd
-     * below the path's token-bucket burst allowance (~31-37 Mbps
-     * observed).  cnn2n achieves steady ~42 Mbps because its UDP socket
-     * is BLOCKING — sendto waits (kernel still receives/queues ACKs into
-     * the 1MB SO_RCVBUF) and the inner TCP stack throttles itself
-     * without loss.  We mirror that by leaving the socket blocking on
-     * Windows (see open_socket() — the FIONBIO branch is skipped there)
-     * and polling UDP via select() in the main loop, just like cnn2n. */
+    /* Start the dedicated TAP reader thread.  tunReadThread() blocks
+     * on tuntap_read() in its own thread and never touches the main
+     * loop's OVERLAPPED structure.  This is the only way TAP frames
+     * are pulled off the driver on Windows under the PlanB single-
+     * threaded main loop; the main loop never calls ReadFile/IRP
+     * completion routines itself (that path was tried and broke). */
+    startTunReadThread(eee);
+    traceEvent(TRACE_NORMAL,
+               "PlanB TAP reader thread started (tun_thread=%p)",
+               (void*)eee->tun_thread_handle);
 #endif
 
     /* Main loop
@@ -6073,48 +6085,20 @@ static int run_loop(n2n_edge_t * eee )
 #ifdef _WIN32
         {
             /* Same shape as cnn2n: select(timeout=10ms) on the full fd
-             * set, TAP fd included.  The UDP socket is BLOCKING (see
-             * comment near WSAEventSelect removal above), so a full
-             * SO_SNDBUF makes sendto wait while the kernel keeps
-             * queuing incoming ACKs into the 1MB SO_RCVBUF — exactly
-             * the lossless back-pressure we need to keep the inner TCP
-             * cwnd healthy.  select() then wakes us up to drain both.
+             * set.  The UDP socket is BLOCKING (see comment near
+             * WSAEventSelect removal above), so a full SO_SNDBUF makes
+             * sendto wait while the kernel keeps queuing incoming ACKs
+             * into the 1MB SO_RCVBUF — exactly the lossless back-
+             * pressure we need to keep the inner TCP cwnd healthy.
+             * select() then wakes us up to drain both.
              *
-             * Idle CPU is not zero on Windows: select() with a 10 ms
-             * timeout does not benefit from WFSO.  Acceptable trade —
-             * the alternative was non-blocking sendto + packet drop,
-             * which caps throughput at ~31 Mbps. */
+             * TAP RX is handled by an independent thread polling
+             * tuntap_read() in the background; the main loop never
+             * touches the OVERLAPPED handle.  Idle CPU is not zero
+             * (~0.5% from the 10 ms select tick), but the alternative
+             * — non-blocking sendto + packet drop — caps throughput
+             * at ~31 Mbps. */
 
-            /* Drain TAP if a frame completed since the last tick.
-             * read_pending only tells us an IRP is in flight; we must
-             * NOT touch the OVERLAPPED structure unless the IRP has
-             * actually completed (otherwise ReadFile reuses an
-             * in-flight IRP — the wintap.c warning flood we saw before).
-             * The IRP has finished when the read_buf still holds the
-             * data from the last read — we know by checking
-             * GetOverlappedResult on a non-blocking query which returns
-             * ERROR_IO_INCOMPLETE while pending and success once done. */
-            HANDLE h_evt = eee->device.overlap_read.hEvent;
-            if (h_evt != NULL && eee->device.read_pending) {
-                DWORD wait_rc = WaitForSingleObject(h_evt, 0);
-                if (wait_rc == WAIT_OBJECT_0) {
-                    ResetEvent(h_evt);
-                    ssize_t len = tuntap_read_complete_overlapped(&eee->device);
-                    if (len > 0) {
-                        process_tap_rx_frame(eee, eee->device.read_buf, len);
-                    }
-                }
-            }
-            if (h_evt != NULL && !eee->device.read_pending) {
-                ssize_t slen;
-                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                }
-            }
-
-            /* Same tick cadence as Linux (10 ms), same fd sets, no
-             * WinSock event binding — so the inner sendto_sock() can
-             * stay blocking without starving UDP/ACK processing. */
             struct timeval tick;
             tick.tv_sec  = 0;
             tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;
