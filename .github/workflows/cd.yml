@@ -207,7 +207,10 @@ jobs:
             EXTRA=""
           fi
           # Architecture-specific optimization flags:
-          # - aarch64: NEON always available; -DSPECK_ARM_NEON enables Speck NEON path
+          # - aarch64: NEON is baseline; -DSPECK_ARM_NEON enables Speck NEON.
+          #   -march=armv8-a+crypto is implied on aarch64-linux-musl GCC, but we
+          #   pass it explicitly to avoid silent fallback to plain-C Speck on
+          #   rare distros that strip the default flags.
           # - armv7 Cortex-A (musleabihf): -DSPECK_ARM_NEON -mfpu=neon
           # - armv7 Cortex-M (musleabi): NO NEON (architecture lacks it)
           # - x86_64/arm/mips legacy: no SIMD flags
@@ -216,8 +219,8 @@ jobs:
           #   re-validating on the target hardware.
           ARCH_FLAGS=""
           case "${{ matrix.TARGET }}" in
-            aarch64-*)       ARCH_FLAGS="-DSPECK_ARM_NEON" ;;
-            armv7-linux-musleabihf*) ARCH_FLAGS="-DSPECK_ARM_NEON -mfpu=neon" ;;
+            aarch64-*)       ARCH_FLAGS="-DSPECK_ARM_NEON -march=armv8-a+crypto+fp+simd" ;;
+            armv7-linux-musleabihf*) ARCH_FLAGS="-DSPECK_ARM_NEON -mfpu=neon -mfloat-abi=hard" ;;
           esac
           echo "Target=${{ matrix.TARGET }} ARCH_FLAGS=$ARCH_FLAGS EXTRA=$EXTRA"
           cmake .. \
