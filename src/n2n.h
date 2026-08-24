@@ -279,7 +279,7 @@ typedef struct n2n_edge         n2n_edge_t;
  *         TCP cwnd to the actual uplink bandwidth with zero parameters.
  *   Same value at every bandwidth, peer count, and operating system —
  *   fully generic, no scenario-specific tuning required. */
-#define N2N_MAINLOOP_TICK_MS    10
+#define N2N_MAINLOOP_TICK_MS    1
 
 
 /* ************************************** */
