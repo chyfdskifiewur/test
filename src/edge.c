@@ -788,15 +788,17 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     /* PlanB single-thread: a full SO_SNDBUF must not turn into packet LOSS.
      * cnn2n's UDP socket is BLOCKING, so its sendto simply waits when the
      * buffer is full — the local TCP stack then throttles itself without
-     * loss and a single iperf3 stream reaches ~52 Mbps. Dropping instead
-     * (old behaviour) collapses TCP cwnd every buffer-full event: single
-     * stream ~30 Mbps while -P4 hides the loss at ~50 Mbps.
+     * loss and a single iperf3 stream reaches ~48 Mbps even on a bad path.
+     * Dropping instead collapses the inner TCP cwnd below the path's token
+     * bucket burst allowance every buffer-full event: in-flight sticks at
+     * ~64KB (= ~31-37 Mbps x RTT) instead of growing to the ~78KB the
+     * bucket actually allows.  The wait cap MUST exceed the drain time of
+     * one full cwnd burst: 78KB at 36 Mbps = 17ms, and a completely full
+     * 1MB buffer takes ~220ms — hence 500 x 1ms, not 10.
      * We must stay non-blocking for recv (the drain loops terminate on
-     * WSAEWOULDBLOCK), so we only wait for WRITABILITY here — bounded
-     * (10 x 1 ms) so the main loop can never starve: ACKs keep arriving
-     * and the buffer drains at uplink rate, typical wait is one slice. */
+     * WSAEWOULDBLOCK), so we only wait for WRITABILITY here. */
 #ifdef _WIN32
-    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    for( int retry = 0; retry < 500 && sent < 0; retry++ )
     {
         if( WSAGetLastError() != WSAEWOULDBLOCK )
             break;
