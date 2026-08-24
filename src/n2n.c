@@ -53,12 +53,19 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
         return -1;
     }
 
+    /* Deliberately NOT setting FIONBIO on Windows.  A blocking sendto
+     * is what makes cnn2n sustain ~42 Mbps: when SO_SNDBUF is full,
+     * sendto waits while the kernel keeps queuing incoming ACKs into
+     * the 1MB SO_RCVBUF.  This is lossless back-pressure — the inner
+     * TCP stack throttles itself, cwnd grows to fill the path's
+     * token-bucket burst allowance, no retransmits.  Non-blocking
+     * sendto with drop-on-EWOULDBLOCK caps single-stream throughput
+     * at ~31 Mbps because every SNDBUF-full event collapses cwnd
+     * below the burst size. */
 #ifndef _WIN32
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else
     {
-        u_long mode = 1;
-        ioctlsocket(sock_fd, FIONBIO, &mode);
         /* Prevent WSAECONNRESET error spam on Windows when ICMP
          * port unreachable messages arrive for this UDP socket. */
         DWORD bytesReturned = 0;

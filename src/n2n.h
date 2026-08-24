@@ -276,17 +276,17 @@ typedef struct n2n_edge         n2n_edge_t;
  *   constraints that every n2n edge deployment has to handle:
  *     (1) KCP ikcp_update() runs naturally at 100 Hz,
  *     (2) ingress fds (UDP v4/v6, mgmt sock, WS, bypass proxy/conns) are
- *         polled via select(timeout=0) after every wakeup, so worst-case
- *         0-10 ms extra ingress latency — completely invisible to
- *         interactive ping (RTT >> 10 ms on any real WAN link),
- *     (3) Windows side binds FD_READ of the UDP socket to a WSA event and
- *         blocks in WaitForMultipleObjects on [TAP overlapped completion,
- *         UDP event] with this timeout as upper bound: idle CPU = 0,
- *         wakeup latency = 0 for the two hot sources.  WSAEventSelect's
- *         implicit switch to non-blocking mode is harmless here because
- *         open_socket() already sets FIONBIO and sendto() drops on
- *         WSAEWOULDBLOCK by design (TCP retransmits recover).  All other
- *         fds are still polled by select(timeout=0) after each wakeup.
+ *         polled via select(timeout=10ms) — the same as Linux — so
+ *         worst-case 0-10 ms extra ingress latency, invisible on any
+ *         real WAN link,
+ *     (3) Windows uses the SAME select() shape as cnn2n.  Crucially,
+ *         the UDP socket stays BLOCKING on Windows (we deliberately do
+ *         NOT call WSAEventSelect — it would force non-blocking mode
+ *         and break lossless sendto back-pressure, capping throughput
+ *         at ~31 Mbps).  TAP RX completion is checked via a non-blocking
+ *         WaitForSingleObject on the overlapped event just before the
+ *         select() call.  Idle CPU is not zero (~0.5%), but the
+ *         alternative is broken throughput.
  *   Same value at every bandwidth, peer count, and operating system —
  *   fully generic, no scenario-specific tuning required. */
 #define N2N_MAINLOOP_TICK_MS    10

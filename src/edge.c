@@ -785,34 +785,14 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* PlanB single-thread: a full SO_SNDBUF must not turn into packet LOSS.
-     * cnn2n's UDP socket is BLOCKING, so its sendto simply waits when the
-     * buffer is full — the local TCP stack then throttles itself without
-     * loss and a single iperf3 stream reaches ~48 Mbps even on a bad path.
-     * Dropping instead collapses the inner TCP cwnd below the path's token
-     * bucket burst allowance every buffer-full event: in-flight sticks at
-     * ~64KB (= ~31-37 Mbps x RTT) instead of growing to the ~78KB the
-     * bucket actually allows.  The wait cap MUST exceed the drain time of
-     * one full cwnd burst: 78KB at 36 Mbps = 17ms, and a completely full
-     * 1MB buffer takes ~220ms — hence 500 x 1ms, not 10.
-     * We must stay non-blocking for recv (the drain loops terminate on
-     * WSAEWOULDBLOCK), so we only wait for WRITABILITY here. */
+        /* PlanB single-thread: on Windows the UDP socket is BLOCKING, so
+     * a full SO_SNDBUF simply makes sendto wait — the kernel keeps
+     * queuing incoming ACKs into the 1MB SO_RCVBUF, no packet loss.
+     * This is exactly the lossless back-pressure that lets cnn2n
+     * sustain ~42 Mbps.  On Linux the socket is non-blocking, so we
+     * still need the bounded retry to avoid dropping. */
 #ifdef _WIN32
-    for( int retry = 0; retry < 500 && sent < 0; retry++ )
-    {
-        if( WSAGetLastError() != WSAEWOULDBLOCK )
-            break;
-        fd_set wfds;
-        struct timeval tv;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        tv.tv_sec  = 0;
-        tv.tv_usec = 1000;
-        if( select( 0 /*ignored on Win32*/, NULL, &wfds, NULL, &tv ) <= 0 )
-            continue;               /* not writable yet: recheck sendto once more */
-        sent = sendto( fd, buf, len, 0/*flags*/,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
+    (void)0; /* blocking sendto does the right thing on its own */
 #else
     for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
@@ -5984,22 +5964,17 @@ static int run_loop(n2n_edge_t * eee )
                    (void*)(UINT_PTR)eee->device.device_handle);
     }
 
-    /* Bind FD_READ of the UDP socket(s) to ONE WSA event so the main loop
-     * can block on BOTH hot ingress sources (TAP overlapped completion +
-     * UDP packets, i.e. data AND ACKs) with a single WaitForMultipleObjects:
-     * idle CPU = 0, wakeup latency = 0 — same event-driven shape as cnn2n.
-     * WSAEventSelect does force the socket into non-blocking mode, but
-     * open_socket() already sets FIONBIO, so there is no mode change and
-     * sendto() behaviour is unchanged (drop on WSAEWOULDBLOCK by design). */
-    WSAEVENT udp_evt = WSA_INVALID_EVENT;
-    if (eee->udp_sock != -1) {
-        udp_evt = WSACreateEvent();
-        if (udp_evt != WSA_INVALID_EVENT) {
-            WSAEventSelect(eee->udp_sock, udp_evt, FD_READ);
-            if (eee->udp_sock6 != -1)
-                WSAEventSelect(eee->udp_sock6, udp_evt, FD_READ);
-        }
-    }
+    /* Deliberately NOT using WSAEventSelect on the UDP socket.  WSA docs:
+     *   "WSAEventSelect automatically sets socket s to nonblocking mode".
+     * A non-blocking sendto on a full SO_SNDBUF returns WSAEWOULDBLOCK;
+     * we currently drop the packet, which collapses the inner TCP cwnd
+     * below the path's token-bucket burst allowance (~31-37 Mbps
+     * observed).  cnn2n achieves steady ~42 Mbps because its UDP socket
+     * is BLOCKING — sendto waits (kernel still receives/queues ACKs into
+     * the 1MB SO_RCVBUF) and the inner TCP stack throttles itself
+     * without loss.  We mirror that by leaving the socket blocking on
+     * Windows (see open_socket() — the FIONBIO branch is skipped there)
+     * and polling UDP via select() in the main loop, just like cnn2n. */
 #endif
 
     /* Main loop
@@ -6097,97 +6072,54 @@ static int run_loop(n2n_edge_t * eee )
          *            all I/O stays single-threaded. ---------- */
 #ifdef _WIN32
         {
+            /* Same shape as cnn2n: select(timeout=10ms) on the full fd
+             * set, TAP fd included.  The UDP socket is BLOCKING (see
+             * comment near WSAEventSelect removal above), so a full
+             * SO_SNDBUF makes sendto wait while the kernel keeps
+             * queuing incoming ACKs into the 1MB SO_RCVBUF — exactly
+             * the lossless back-pressure we need to keep the inner TCP
+             * cwnd healthy.  select() then wakes us up to drain both.
+             *
+             * Idle CPU is not zero on Windows: select() with a 10 ms
+             * timeout does not benefit from WFSO.  Acceptable trade —
+             * the alternative was non-blocking sendto + packet drop,
+             * which caps throughput at ~31 Mbps. */
+
+            /* Drain TAP if a frame completed since the last tick.
+             * read_pending only tells us an IRP is in flight; we must
+             * NOT touch the OVERLAPPED structure unless the IRP has
+             * actually completed (otherwise ReadFile reuses an
+             * in-flight IRP — the wintap.c warning flood we saw before).
+             * The IRP has finished when the read_buf still holds the
+             * data from the last read — we know by checking
+             * GetOverlappedResult on a non-blocking query which returns
+             * ERROR_IO_INCOMPLETE while pending and success once done. */
             HANDLE h_evt = eee->device.overlap_read.hEvent;
-            BOOL tap_evt_valid = (h_evt != NULL);
-
-            DWORD wfso_rc = WAIT_TIMEOUT;
-            if (tap_evt_valid || udp_evt != WSA_INVALID_EVENT) {
-                /* Block on BOTH hot sources at once (10 ms upper bound
-                 *   preserves the POSIX tick cadence for the remaining
-                 *   fds — mgmt / WS / bypass — which select(0) below
-                 *   still polls after every wakeup):
-                 *     waits[0] = TAP overlapped read completion event
-                 *     waits[1] = UDP socket FD_READ (data + TCP ACKs)
-                 *   Idle CPU = 0 (no busy-spin), event latency = 0. */
-                HANDLE waits[2];
-                DWORD nh = 0;
-                if (tap_evt_valid)
-                    waits[nh++] = h_evt;
-                if (udp_evt != WSA_INVALID_EVENT)
-                    waits[nh++] = (HANDLE)udp_evt;
-                wfso_rc = WaitForMultipleObjects(nh, waits, FALSE,
-                                                 (DWORD)N2N_MAINLOOP_TICK_MS);
-                if (udp_evt != WSA_INVALID_EVENT)
-                    WSAResetEvent(udp_evt); /* manual-reset: clear or WFMO spins */
-            } else {
-                /* Fallback — event handle missing (tuntap_open failed to
-                 *   create it).  Poll at the fixed tick cadence; TAP RX
-                 *   won't work but the rest stays alive and we keep
-                 *   trying to re-prime the reader below so a tuntap
-                 *   restart can recover.  Rate-limit the warning so
-                 *   we don't flood the log. */
-                static unsigned warn_suppress = 0;
-                if (warn_suppress == 0)
-                    traceEvent(TRACE_WARNING,
-                               "PlanB: no overlap_read event, polling-only mode");
-                warn_suppress = (warn_suppress + 1) & 0xFFu;
-                Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
+            if (h_evt != NULL && eee->device.read_pending) {
+                DWORD wait_rc = WaitForSingleObject(h_evt, 0);
+                if (wait_rc == WAIT_OBJECT_0) {
+                    ResetEvent(h_evt);
+                    ssize_t len = tuntap_read_complete_overlapped(&eee->device);
+                    if (len > 0) {
+                        process_tap_rx_frame(eee, eee->device.read_buf, len);
+                    }
+                }
             }
-
-            /* ONLY harvest the overlapped read when the TAP event was the
-             *   signalled one (WAIT_OBJECT_0 == waits[0], tap is always
-             *   index 0) — i.e. the IRP has completed.
-             *   read_pending just means "an IRP was submitted", NOT "the
-             *   IRP completed": on a timeout the IRP is still pending
-             *   on overlap_read and MUST NOT be touched.  Calling
-             *   GetOverlappedResult(bWait=FALSE) on a still-pending IRP
-             *   fails with ERROR_IO_INCOMPLETE, and — worse — clearing
-             *   read_pending then submitting a fresh ReadFile reuses the
-             *   same OVERLAPPED structure while the previous IRP is still
-             *   in flight (undefined; every subsequent ReadFile fails) —
-             *   this was the warning flood at wintap.c:524/492 on idle
-             *   startup.  Leaving read_pending=1 alone is correct: the
-             *   pending IRP completes on a future tick and the
-             *   manual-reset event wakes us immediately then. */
-            if (tap_evt_valid && wfso_rc == WAIT_OBJECT_0 && eee->device.read_pending) {
-                ResetEvent(eee->device.overlap_read.hEvent);
-                ssize_t len = tuntap_read_complete_overlapped(&eee->device);
-                if (len > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, len);
-                }
-                /* Submit the NEXT read, and keep draining any frames
-                 *   that complete synchronously (driver backlog) until
-                 *   we've queued a real async IRP (read_pending=1).
-                 *   This guarantees we never enter WFSO without an IRP
-                 *   already pending — otherwise TAP traffic would have
-                 *   to wait for the timeout tick to get noticed. */
-                ssize_t slen;
-                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                }
-            } else if (!eee->device.read_pending) {
-                /* read_pending == 0 means no IRP was in flight on
-                 *   entry to the tick (previous submit failed, or we
-                 *   got here via shutdown / transient error path).
-                 *   Re-submit one so we don't lose TAP input. */
+            if (h_evt != NULL && !eee->device.read_pending) {
                 ssize_t slen;
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
                 }
             }
-            /* else: WFSO timed out with an IRP still pending — leave it
-             *       in flight and fall through to the socket poll below. */
 
-            /* Zero-timeout poll walks every fd (UDP v4/v6, mgmt,
-             *   WS, bypass proxy & conns — read and write sets) using
-             *   the EXACT same POSIX loop body as Linux.  No fd
-             *   type needs WinSock-specific binding; every fd is
-             *   starved at most N2N_MAINLOOP_TICK_MS = 10 ms. */
-            struct timeval zt;
-            zt.tv_sec  = 0;
-            zt.tv_usec = 0;
+            /* Same tick cadence as Linux (10 ms), same fd sets, no
+             * WinSock event binding — so the inner sendto_sock() can
+             * stay blocking without starving UDP/ACK processing. */
+            struct timeval tick;
+            tick.tv_sec  = 0;
+            tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;
             rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &tick);
         }
 #else
         {
@@ -6555,10 +6487,6 @@ static int run_loop(n2n_edge_t * eee )
 cleanup:
 #ifdef _WIN32
     eee->keep_running = 0;
-    if (udp_evt != WSA_INVALID_EVENT) {
-        WSACloseEvent(udp_evt);
-        udp_evt = WSA_INVALID_EVENT;
-    }
     /* Close TAP first to wake up the TUN reader thread blocked on tuntap_read() */
     tuntap_close(&(eee->device));
     if (eee->tun_thread_handle != NULL) {
