@@ -6087,11 +6087,11 @@ static int run_loop(n2n_edge_t * eee )
              *   draining happens via the post-WFSO select(timeout=0)
              *   pass below — exactly the same FD walk as Linux. */
             HANDLE handles[3];
-             int n_handles = 0;
-             HANDLE h_tap = eee->device.overlap_read.hEvent;
-             if (h_tap != NULL) handles[n_handles++] = h_tap;       /* [0] */
-             if (eee->device.udp_sock_event)  handles[n_handles++] = eee->device.udp_sock_event;  /* [1] */
-             if (eee->device.udp_sock6_event) handles[n_handles++] = eee->device.udp_sock6_event; /* [2] */
+            int n_handles = 0;
+            HANDLE h_tap = eee->device.overlap_read.hEvent;
+            if (h_tap != NULL) handles[n_handles++] = h_tap;       /* [0] */
+            if (eee->device.udp_sock_event)  handles[n_handles++] = eee->device.udp_sock_event;  /* [1] */
+            if (eee->device.udp_sock6_event) handles[n_handles++] = eee->device.udp_sock6_event; /* [2] */
 
             DWORD wfso_rc;
             if (n_handles > 0) {
