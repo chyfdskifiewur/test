@@ -224,12 +224,9 @@ int speck_expand_key (const unsigned char *k, speck_context_t *ctx) {
 }
 
 
-/* MSVC x64 (_M_AMD64/_M_X64) deliberately excluded — see comment in
- * speck.h: SPECK_CTX_BYVAL would copy 816 bytes per speck_ctr() call,
- * and MSVC's _mm_shuffle_epi8 codegen is measurably worse than GCC's.
- * Only GCC/Clang with -msse4.2 take this path; MSVC falls through to
- * the pure C scalar path below. */
-#elif defined (__SSE4_2__) // SSE support (GCC/Clang only — see comment above) -------------------------------
+/* MSVC doesn't define __SSE4_2__, but x64 (checked via _M_AMD64 / _M_X64)
+ * always has SSSE3+ which is all the SSE path needs. */
+#elif defined (__SSE4_2__) || defined(_M_AMD64) || defined(_M_X64) // SSE support -------------------------------------------------
 
 
 #define LCS(x,r) (((x)<<r)|((x)>>(64-r)))

@@ -53,14 +53,6 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
         return -1;
     }
 
-    /* PlanB single-thread reverts to non-blocking on Windows to avoid
-     * a recv-deadlock when the main loop calls blocking sendto on a
-     * full SO_SNDBUF (the inner select() can no longer wake to drain
-     * incoming ACKs).  The retry loop in sendto_sock() bounds the
-     * wait to ~10 ms — shorter than Linux's own cwnd recovery time
-     * at our target throughput, so the inner TCP stack still sees
-     * almost-zero packet loss.  RTT stays around 13-16 ms depending
-     * on the path's per-flow token bucket. */
 #ifndef _WIN32
     fcntl(sock_fd, F_SETFL, O_NONBLOCK);
 #else

@@ -592,6 +592,18 @@ void tuntap_close(struct tuntap_dev *tuntap) {
         CloseHandle(tuntap->overlap_write.hEvent);
         tuntap->overlap_write.hEvent = NULL;
     }
+
+    /* Plan B: release WinSock event handles (if any were created).  Note:
+     *   WSAEventSelect(s, NULL, 0) was implicitly called when the socket
+     *   was closed elsewhere; we only need to drop the HANDLE here. */
+    if (tuntap->udp_sock_event) {
+        CloseHandle(tuntap->udp_sock_event);
+        tuntap->udp_sock_event = NULL;
+    }
+    if (tuntap->udp_sock6_event) {
+        CloseHandle(tuntap->udp_sock6_event);
+        tuntap->udp_sock6_event = NULL;
+    }
 }
 
 int tuntap_restart( tuntap_dev* device ) {

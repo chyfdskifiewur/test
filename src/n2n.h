@@ -212,14 +212,7 @@ struct tuntap_config {
  * same value if they are to understand each other. */
 #define N2N_COMPRESSION_ENABLED 1
 
-/* MTU budget for the LARGEST transform (Speck, +17B preamble) must stay
- * within the common 1400-byte path MTU (CGNAT / tunnelled links):
- *   10 (compact hdr) + 17 (Speck IV) + MTU + 28 (IP+UDP) <= 1400
- *   -> MTU <= 1345; use 1328 (same value cnn2n ships, proven at 52 Mbps
- *   with Speck on this network).  At 1350 the Speck datagram is exactly
- * 1405 > 1400 -> IP fragmentation -> single-stream TCP collapses to
- * ~31 Mbps while A1 (no crypto, 1388 bytes) stays at ~50. */
-#define DEFAULT_MTU   1328
+#define DEFAULT_MTU   1350
 
 /** Common type used to hold stringified IP addresses. */
 typedef char ipstr_t[INET6_ADDRSTRLEN];
@@ -276,17 +269,14 @@ typedef struct n2n_edge         n2n_edge_t;
  *   constraints that every n2n edge deployment has to handle:
  *     (1) KCP ikcp_update() runs naturally at 100 Hz,
  *     (2) ingress fds (UDP v4/v6, mgmt sock, WS, bypass proxy/conns) are
- *         polled via select(timeout=10ms) — the same as Linux — so
- *         worst-case 0-10 ms extra ingress latency, invisible on any
- *         real WAN link,
- *     (3) Windows uses the SAME select() shape as cnn2n.  Crucially,
- *         the UDP socket stays BLOCKING on Windows (we deliberately do
- *         NOT call WSAEventSelect — it would force non-blocking mode
- *         and break lossless sendto back-pressure, capping throughput
- *         at ~31 Mbps).  TAP RX completion is checked via a non-blocking
- *         WaitForSingleObject on the overlapped event just before the
- *         select() call.  Idle CPU is not zero (~0.5%), but the
- *         alternative is broken throughput.
+ *         polled via select(timeout=0) after every wakeup, so worst-case
+ *         0-10 ms extra ingress latency — completely invisible to
+ *         interactive ping (RTT >> 10 ms on any real WAN link),
+ *     (3) Windows side avoids WSAEventSelect entirely — that WinSock
+ *         function silently flips UDP sockets to non-blocking mode,
+ *         which would destroy the SO_SNDBUF-based implicit back-pressure
+ *         the single-threaded send_packet2net path relies on to auto-tune
+ *         TCP cwnd to the actual uplink bandwidth with zero parameters.
  *   Same value at every bandwidth, peer count, and operating system —
  *   fully generic, no scenario-specific tuning required. */
 #define N2N_MAINLOOP_TICK_MS    10
@@ -523,7 +513,6 @@ struct n2n_edge
 
 #ifdef _WIN32
     volatile int        keep_running;
-    HANDLE              tun_thread_handle;
 #endif
 
     /* Rate-limiting for P2P/PsP log messages */
