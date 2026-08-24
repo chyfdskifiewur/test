@@ -513,7 +513,7 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     eee->udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
 
 #ifdef _WIN32
-    /* Plan B: bind a WSA event to each UDP socket so the main loop can
+    /* Bind a WSA event to each UDP socket so the main loop can
      *   WaitForMultipleObjects() on them alongside the TAP overlapped
      *   event.  The event fires for FD_READ | FD_CLOSE; the loop drains
      *   via the same FD_ISSET/select(timeout=0) path so we never need
@@ -832,7 +832,7 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* PlanB single-thread: retry loop would block the main thread,
+    /* Single-thread design: a retry loop would block the main thread,
      * preventing UDP ACK processing and destroying throughput.
      * If the send buffer is full, drop the packet — TCP retransmits.
      * The 128-loop in the main loop processes ACKs quickly so TCP
@@ -2789,8 +2789,7 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
     return retval;
 }
 
-/** Shared helper for Plan B (OVERLAPPED single-threaded TAP reader).
- *  Process one raw Ethernet frame from TAP RX: apply multicast drop,
+/** Process one raw Ethernet frame from TAP RX: apply multicast drop,
  *  then try bypass fast-path, otherwise send via n2n overlay.
  *  This is the EXACT same downstream path readFromTAPSocket uses,
  *  extracted to a helper so we can call it from three places:
@@ -5936,7 +5935,7 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    /* Plan B: single-threaded TAP reader using OVERLAPPED I/O —
+    /* Single-threaded TAP reader using OVERLAPPED I/O —
      *   architecture 100% aligned with cnn2n.  No tunReadThread,
      *   no ring buffer, no cross-thread events.  TAP reads are
      *   submitted as overlapped IRPs, completions are signalled
@@ -5965,13 +5964,13 @@ static int run_loop(n2n_edge_t * eee )
             process_tap_rx_frame(eee, eee->device.read_buf, slen);
         }
         traceEvent(TRACE_NORMAL,
-                   "PlanB TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
+                   "TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
                    (unsigned)eee->device.read_pending, (int)slen);
     }
     else
     {
         traceEvent(TRACE_WARNING,
-                   "PlanB TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
+                   "TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
                    eee->device.overlap_read.hEvent,
                    (void*)(UINT_PTR)eee->device.device_handle);
     }
@@ -5990,12 +5989,6 @@ static int run_loop(n2n_edge_t * eee )
         fd_set socket_mask;
         struct timeval wait_time;
         time_t nowTime;
-        static int tick_count = 0;  /* diagnostic-only — never affects behaviour */
-        if (tick_count < 2) {
-            traceEvent(TRACE_NORMAL, "PlanB: main loop tick %d (keep_running=%d g_edge_running=%d)",
-                       tick_count + 1, keep_running, (int)g_edge_running);
-            ++tick_count;
-        }
 
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
@@ -6049,7 +6042,7 @@ static int run_loop(n2n_edge_t * eee )
          *   and 0-10 ms added ingress latency on non-TAP fds is
          *   invisible on any real WAN RTT.  Completely generic.
          *
-         *   Windows: Plan B — NO select(), NO separate tunReadThread.
+         *   Windows: single-threaded OVERLAPPED I/O — no separate tunReadThread.
          *            We block on overlap_read.hEvent (the single kernel
          *            notification that TAP driver has completed a read
          *            IRP we submitted) and combine that with a 10 ms
@@ -6072,7 +6065,7 @@ static int run_loop(n2n_edge_t * eee )
          *            all I/O stays single-threaded. ---------- */
 #ifdef _WIN32
         {
-            /* Plan B — single-threaded, fully event-driven Windows I/O.
+            /* Single-threaded, fully event-driven Windows I/O.
              *
              *   WaitForMultipleObjects() on:
              *     [0] TAP overlapped read completion event
@@ -6103,7 +6096,7 @@ static int run_loop(n2n_edge_t * eee )
                 static unsigned warn_suppress = 0;
                 if (warn_suppress == 0)
                     traceEvent(TRACE_WARNING,
-                               "PlanB: no events bound, sleeping only");
+                               "TAP event handle unavailable, falling back to sleep");
                 warn_suppress = (warn_suppress + 1) & 0xFFu;
                 Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
                 wfso_rc = WAIT_TIMEOUT;
