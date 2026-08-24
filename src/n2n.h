@@ -272,14 +272,11 @@ typedef struct n2n_edge         n2n_edge_t;
  *         polled via select(timeout=0) after every wakeup, so worst-case
  *         0-10 ms extra ingress latency — completely invisible to
  *         interactive ping (RTT >> 10 ms on any real WAN link),
- *     (3) Windows side binds FD_READ of the UDP socket to a WSA event and
- *         blocks in WaitForMultipleObjects on [TAP overlapped completion,
- *         UDP event] with this timeout as upper bound: idle CPU = 0,
- *         wakeup latency = 0 for the two hot sources.  WSAEventSelect's
- *         implicit switch to non-blocking mode is harmless here because
- *         open_socket() already sets FIONBIO and sendto() drops on
- *         WSAEWOULDBLOCK by design (TCP retransmits recover).  All other
- *         fds are still polled by select(timeout=0) after each wakeup.
+ *     (3) Windows side avoids WSAEventSelect entirely — that WinSock
+ *         function silently flips UDP sockets to non-blocking mode,
+ *         which would destroy the SO_SNDBUF-based implicit back-pressure
+ *         the single-threaded send_packet2net path relies on to auto-tune
+ *         TCP cwnd to the actual uplink bandwidth with zero parameters.
  *   Same value at every bandwidth, peer count, and operating system —
  *   fully generic, no scenario-specific tuning required. */
 #define N2N_MAINLOOP_TICK_MS    10

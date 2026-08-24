@@ -44,30 +44,9 @@ int transop_deinit_speck(n2n_trans_op_t *arg) {
     return 0;
 }
 
-/* Generate IV.  We use an 8-byte counter prefixed by 8 random bytes —
- *   CTR mode security only requires unique IVs per (key) lifetime, not
- *   cryptographic randomness, so an incrementing counter is faster than
- *   the PRNG call (~10x cheaper on x86, helps reach cnn2n's 50 Mbps). */
-static void set_speck_iv(transop_speck_t *priv, uint8_t *ivec) {
-    /* First 8 bytes: random base (set once at init), unchanged per call */
-    static uint8_t base[8];
-    static int initialized = 0;
-    if (!initialized) {
-        fast_rand_bytes(base, 8);
-        initialized = 1;
-    }
-    memcpy(ivec, base, 8);
-    /* Last 8 bytes: incrementing counter (big-endian) */
-    static uint64_t counter = 0;
-    uint64_t c = ++counter;
-    ivec[8]  = (uint8_t)(c >> 56);
-    ivec[9]  = (uint8_t)(c >> 48);
-    ivec[10] = (uint8_t)(c >> 40);
-    ivec[11] = (uint8_t)(c >> 32);
-    ivec[12] = (uint8_t)(c >> 24);
-    ivec[13] = (uint8_t)(c >> 16);
-    ivec[14] = (uint8_t)(c >> 8);
-    ivec[15] = (uint8_t)(c);
+/* Generate IV using fast PRNG (no syscall overhead). */
+static void set_speck_iv(transop_speck_t *priv _unused_, uint8_t *ivec) {
+    fast_rand_bytes(ivec, N2N_SPECK_NONCE_SIZE);
 }
 
 ssize_t transop_encode_speck(n2n_trans_op_t *arg,
