@@ -119,7 +119,7 @@ typedef struct tuntap_dev {
     HANDLE write_thread;
     volatile bool write_thread_running;
 
-    /* Plan B: WinSock event handles for main-loop WFSO wake-up.
+    /* WinSock event handles for main-loop WFSO wake-up.
      *   Bound via WSAEventSelect(FD_READ|FD_CLOSE) on the corresponding
      *   socket.  Created in setup_sockets(); closed in tuntap_close().
      *   Only meaningful on Windows. */
