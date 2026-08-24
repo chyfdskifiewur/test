@@ -5960,6 +5960,23 @@ static int run_loop(n2n_edge_t * eee )
                    eee->device.overlap_read.hEvent,
                    (void*)(UINT_PTR)eee->device.device_handle);
     }
+
+    /* Bind FD_READ of the UDP socket(s) to ONE WSA event so the main loop
+     * can block on BOTH hot ingress sources (TAP overlapped completion +
+     * UDP packets, i.e. data AND ACKs) with a single WaitForMultipleObjects:
+     * idle CPU = 0, wakeup latency = 0 — same event-driven shape as cnn2n.
+     * WSAEventSelect does force the socket into non-blocking mode, but
+     * open_socket() already sets FIONBIO, so there is no mode change and
+     * sendto() behaviour is unchanged (drop on WSAEWOULDBLOCK by design). */
+    WSAEVENT udp_evt = WSA_INVALID_EVENT;
+    if (eee->udp_sock != -1) {
+        udp_evt = WSACreateEvent();
+        if (udp_evt != WSA_INVALID_EVENT) {
+            WSAEventSelect(eee->udp_sock, udp_evt, FD_READ);
+            if (eee->udp_sock6 != -1)
+                WSAEventSelect(eee->udp_sock6, udp_evt, FD_READ);
+        }
+    }
 #endif
 
     /* Main loop
@@ -6061,14 +6078,24 @@ static int run_loop(n2n_edge_t * eee )
             BOOL tap_evt_valid = (h_evt != NULL);
 
             DWORD wfso_rc = WAIT_TIMEOUT;
-            if (tap_evt_valid) {
-                /* Block until the TAP read IRP completes — overlap_read.hEvent
-                  *   is manual-reset so it stays signalled until we ResetEvent()
-                  *   it after calling GetOverlappedResult.  Timeout=0 gives
-                  *   the best throughput (37.9 Mbps vs 29.5 with 1ms) at
-                  *   the cost of ~100% CPU on the main loop when idle —
-                  *   acceptable for an always-on edge process. */
-                wfso_rc = WaitForSingleObject(h_evt, 0);
+            if (tap_evt_valid || udp_evt != WSA_INVALID_EVENT) {
+                /* Block on BOTH hot sources at once (10 ms upper bound
+                 *   preserves the POSIX tick cadence for the remaining
+                 *   fds — mgmt / WS / bypass — which select(0) below
+                 *   still polls after every wakeup):
+                 *     waits[0] = TAP overlapped read completion event
+                 *     waits[1] = UDP socket FD_READ (data + TCP ACKs)
+                 *   Idle CPU = 0 (no busy-spin), event latency = 0. */
+                HANDLE waits[2];
+                DWORD nh = 0;
+                if (tap_evt_valid)
+                    waits[nh++] = h_evt;
+                if (udp_evt != WSA_INVALID_EVENT)
+                    waits[nh++] = (HANDLE)udp_evt;
+                wfso_rc = WaitForMultipleObjects(nh, waits, FALSE,
+                                                 (DWORD)N2N_MAINLOOP_TICK_MS);
+                if (udp_evt != WSA_INVALID_EVENT)
+                    WSAResetEvent(udp_evt); /* manual-reset: clear or WFMO spins */
             } else {
                 /* Fallback — event handle missing (tuntap_open failed to
                  *   create it).  Poll at the fixed tick cadence; TAP RX
@@ -6084,10 +6111,11 @@ static int run_loop(n2n_edge_t * eee )
                 Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
             }
 
-            /* ONLY harvest the overlapped read when the event was actually
-             *   signalled (WAIT_OBJECT_0) — i.e. the IRP has completed.
+            /* ONLY harvest the overlapped read when the TAP event was the
+             *   signalled one (WAIT_OBJECT_0 == waits[0], tap is always
+             *   index 0) — i.e. the IRP has completed.
              *   read_pending just means "an IRP was submitted", NOT "the
-             *   IRP completed": on a WFSO timeout the IRP is still pending
+             *   IRP completed": on a timeout the IRP is still pending
              *   on overlap_read and MUST NOT be touched.  Calling
              *   GetOverlappedResult(bWait=FALSE) on a still-pending IRP
              *   fails with ERROR_IO_INCOMPLETE, and — worse — clearing
@@ -6098,7 +6126,7 @@ static int run_loop(n2n_edge_t * eee )
              *   startup.  Leaving read_pending=1 alone is correct: the
              *   pending IRP completes on a future tick and the
              *   manual-reset event wakes us immediately then. */
-            if (wfso_rc == WAIT_OBJECT_0 && eee->device.read_pending) {
+            if (tap_evt_valid && wfso_rc == WAIT_OBJECT_0 && eee->device.read_pending) {
                 ResetEvent(eee->device.overlap_read.hEvent);
                 ssize_t len = tuntap_read_complete_overlapped(&eee->device);
                 if (len > 0) {
@@ -6504,6 +6532,10 @@ static int run_loop(n2n_edge_t * eee )
 cleanup:
 #ifdef _WIN32
     eee->keep_running = 0;
+    if (udp_evt != WSA_INVALID_EVENT) {
+        WSACloseEvent(udp_evt);
+        udp_evt = WSA_INVALID_EVENT;
+    }
     /* Close TAP first to wake up the TUN reader thread blocked on tuntap_read() */
     tuntap_close(&(eee->device));
     if (eee->tun_thread_handle != NULL) {
