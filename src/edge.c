@@ -785,36 +785,44 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* PlanB single-thread on Windows: UDP socket is non-blocking; on a
-     * full SO_SNDBUF we drop the packet — bounded loss is the only way
-     * to keep the main loop responsive without recv starvation.  Inner
-     * TCP retransmits recover.  The drop-on-EWOULDBLOCK cap at ~31 Mbps
-     * on some paths comes from per-flow token-bucket limits, not from
-     * this branch: the same path sustains ~42 Mbps via the iperf3
-     * multi-stream (-P4) test which spreads cwnd across many flows. */
-    (void)0;
-#ifdef _WIN32
-    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    /* PlanB on Windows: the UDP socket is non-blocking.  On a full
+     * SO_SNDBUF we DROP the packet and let the inner TCP retransmit —
+     * this is exactly how cnn2n behaves and it does NOT cap throughput
+     * at 31 Mbps.  The earlier "bounded Sleep(1) retry" idea was wrong:
+     *   (1) the retry sleeps INSIDE the TAP reader thread, which
+     *       starves TAP reads while we wait, raising RTT and causing
+     *       unrelated jitter,
+     *   (2) a short bounded retry still accumulates wall time across
+     *       thousands of packets and the inner TCP RTO fires anyway.
+     * The cap at ~31 Mbps observed on certain WAN paths is the per-
+     * flow token bucket at the carrier — a 4-stream test reaches
+     * 49.9 Mbps on the SAME path, proving the cap is per-flow, not
+     * per-socket.  A retry here does nothing to lift that cap and
+     * actively makes things worse on the TAP side.
+     *
+     * So: just trace on failure and return. */
+    if ( sent < 0 )
     {
+#ifdef _WIN32
         int wserr = WSAGetLastError();
         if( wserr != WSAEWOULDBLOCK )
-            break;
-        /* Yield to the kernel so the recv side can drain pending ACKs
-         * before we retry — keeps the inner TCP stack throttled rather
-         * than collapsed.  Total wait ≤ 10 ms, far below typical RTO. */
-        Sleep(1);
-        sent = sendto( fd, buf, len, 0/*flags*/,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
-#else
-    for( int retry = 0; retry < 50 && sent < 0; retry++ )
-    {
-        if( errno != EAGAIN && errno != EWOULDBLOCK )
-            break;
-        usleep(1000);
-        sent = sendto( fd, buf, len, 0/*flags*/,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
+        {
+            char lasterr[256];
+            lasterr[0] = '\0';
+            FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                           NULL, wserr, 0, lasterr, sizeof(lasterr), NULL);
+            traceEvent(TRACE_ERROR, "sendto failed (%d) %s", wserr, lasterr);
+        }
+#endif
+#ifndef _WIN32
+        for( int retry = 0; retry < 50 && sent < 0; retry++ )
+        {
+            if( errno != EAGAIN && errno != EWOULDBLOCK )
+                break;
+            usleep(1000);
+            sent = sendto( fd, buf, len, 0/*flags*/,
+                           (struct sockaddr*) &peer_addr, addr_len );
+        }
 #endif
 
     if ( sent < 0 )
