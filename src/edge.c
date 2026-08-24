@@ -363,8 +363,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->upnp_mapped_port = 0;
 #ifdef _WIN32
     InitializeCriticalSection(&eee->peers_lock);
-    eee->keep_running   = 1;
 #endif
+    eee->keep_running   = 1;
     eee->last_register_req = 0;
     eee->register_lifetime = 120;
     eee->last_p2p = 0;

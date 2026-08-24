@@ -511,9 +511,7 @@ struct n2n_edge
     size_t              p2p_tx_bytes;
     size_t              p2p_rx_bytes;
 
-#ifdef _WIN32
     volatile int        keep_running;
-#endif
 
     /* Rate-limiting for P2P/PsP log messages */
     uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
