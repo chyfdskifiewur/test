@@ -785,12 +785,33 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* PlanB single-thread: retry loop would block the main thread,
-     * preventing UDP ACK processing and destroying throughput.
-     * If the send buffer is full, drop the packet — TCP retransmits.
-     * The 128-loop in the main loop processes ACKs quickly so TCP
-     * can recover from any loss. */
-#ifndef _WIN32
+    /* PlanB single-thread: a full SO_SNDBUF must not turn into packet LOSS.
+     * cnn2n's UDP socket is BLOCKING, so its sendto simply waits when the
+     * buffer is full — the local TCP stack then throttles itself without
+     * loss and a single iperf3 stream reaches ~52 Mbps. Dropping instead
+     * (old behaviour) collapses TCP cwnd every buffer-full event: single
+     * stream ~30 Mbps while -P4 hides the loss at ~50 Mbps.
+     * We must stay non-blocking for recv (the drain loops terminate on
+     * WSAEWOULDBLOCK), so we only wait for WRITABILITY here — bounded
+     * (10 x 1 ms) so the main loop can never starve: ACKs keep arriving
+     * and the buffer drains at uplink rate, typical wait is one slice. */
+#ifdef _WIN32
+    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    {
+        if( WSAGetLastError() != WSAEWOULDBLOCK )
+            break;
+        fd_set wfds;
+        struct timeval tv;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        tv.tv_sec  = 0;
+        tv.tv_usec = 1000;
+        if( select( 0 /*ignored on Win32*/, NULL, &wfds, NULL, &tv ) <= 0 )
+            continue;               /* not writable yet: recheck sendto once more */
+        sent = sendto( fd, buf, len, 0/*flags*/,
+                       (struct sockaddr*) &peer_addr, addr_len );
+    }
+#else
     for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
         if( errno != EAGAIN && errno != EWOULDBLOCK )
