@@ -832,18 +832,30 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* Single-thread design: a retry loop would block the main thread,
-     * preventing UDP ACK processing and destroying throughput.
-     * If the send buffer is full, drop the packet — TCP retransmits.
-     * The 128-loop in the main loop processes ACKs quickly so TCP
-     * can recover from any loss. */
-#ifndef _WIN32
+    /* Retry on transient buffer-full conditions.
+     * Short wait for socket write readiness avoids dropping the
+     * packet, preventing TCP cwnd collapse. */
+#ifdef _WIN32
+    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    {
+        int err = WSAGetLastError();
+        if( err != WSAEWOULDBLOCK && err != WSAENOBUFS )
+            break;
+        struct timeval tv = { 0, 1000 };
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        select((int)fd + 1, NULL, &wfds, NULL, &tv);
+        sent = sendto( fd, buf, len, 0,
+                       (struct sockaddr*) &peer_addr, addr_len );
+    }
+#else
     for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
         usleep(1000);
-        sent = sendto( fd, buf, len, 0/*flags*/,
+        sent = sendto( fd, buf, len, 0,
                        (struct sockaddr*) &peer_addr, addr_len );
     }
 #endif
