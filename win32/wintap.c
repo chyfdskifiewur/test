@@ -666,16 +666,21 @@ void tuntap_close(struct tuntap_dev *tuntap) {
     }
 
     if (tuntap->device_handle != INVALID_HANDLE_VALUE) {
-        /* Cancel pending I/O to wake up the TUN reader thread during shutdown. */
+        /* Cancel pending I/O so the read thread's overlapped read completes
+         * with ERROR_OPERATION_ABORTED and the thread can exit.  Keep the
+         * handle open until the read thread has fully stopped, so it can
+         * never issue a ReadFile against a closed handle. */
         CancelIo(tuntap->device_handle);
-        CloseHandle(tuntap->device_handle);
-        tuntap->device_handle = INVALID_HANDLE_VALUE;
     }
 
     if (tuntap->read_thread) {
         WaitForSingleObject(tuntap->read_thread, 2000);
         CloseHandle(tuntap->read_thread);
         tuntap->read_thread = NULL;
+    }
+    if (tuntap->device_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(tuntap->device_handle);
+        tuntap->device_handle = INVALID_HANDLE_VALUE;
     }
     if (tuntap->read_event) {
         CloseHandle(tuntap->read_event);
@@ -740,16 +745,21 @@ int tuntap_restart( tuntap_dev* device ) {
     }
 
     if (device->device_handle != INVALID_HANDLE_VALUE) {
-        /* Cancel pending I/O so the read thread's overlapped read completes. */
+        /* Cancel pending I/O so the read thread's overlapped read completes
+         * with ERROR_OPERATION_ABORTED and the thread can exit.  Keep the
+         * handle open until the read thread has fully stopped, so it can
+         * never issue a ReadFile against a closed handle. */
         CancelIo(device->device_handle);
-        CloseHandle(device->device_handle);
-        device->device_handle = INVALID_HANDLE_VALUE;
     }
 
     if (device->read_thread) {
         WaitForSingleObject(device->read_thread, 2000);
         CloseHandle(device->read_thread);
         device->read_thread = NULL;
+    }
+    if (device->device_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(device->device_handle);
+        device->device_handle = INVALID_HANDLE_VALUE;
     }
     if (device->read_event) {
         CloseHandle(device->read_event);
