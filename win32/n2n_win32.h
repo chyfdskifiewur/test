@@ -92,12 +92,6 @@ struct win_write_packet {
     size_t len;
 };
 
-#define N2N_READ_QUEUE_SIZE 256
-struct win_read_packet {
-    uint8_t buf[1600];
-    size_t len;
-};
-
 typedef struct tuntap_dev {
 	HANDLE device_handle;
 	wchar_t  device_name[40]; /* legnth of a CLSID is 38 */
@@ -124,19 +118,6 @@ typedef struct tuntap_dev {
     HANDLE write_event;
     HANDLE write_thread;
     volatile bool write_thread_running;
-
-    /* Read queue + background read thread (symmetric to write path).
-     *   The background thread continuously submits overlapped ReadFile
-     *   IRPs and queues completed frames here; the main loop consumes
-     *   them via tuntap_read() when read_event fires. */
-    CRITICAL_SECTION read_lock;
-    struct win_read_packet read_queue[N2N_READ_QUEUE_SIZE];
-    volatile int read_queue_head;
-    volatile int read_queue_tail;
-    HANDLE read_event;        /* signalled when >= 1 frame is available */
-    HANDLE read_space_event;  /* signalled when a slot was freed (back-pressure) */
-    HANDLE read_thread;
-    volatile bool read_thread_running;
 
     /* WinSock event handles for main-loop WFSO wake-up.
      *   Bound via WSAEventSelect(FD_READ|FD_CLOSE) on the corresponding

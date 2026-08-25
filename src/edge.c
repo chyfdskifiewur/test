@@ -832,33 +832,33 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* Retry on transient buffer-full conditions.
-     * Short wait for socket write readiness avoids dropping the
-     * packet, preventing TCP cwnd collapse. */
-#ifdef _WIN32
+    /* If the send buffer is transiently full, retry briefly.  On Windows
+     *   the UDP socket is non-blocking and a busy outbound burst can push
+     *   sendto() to WSAEWOULDBLOCK/WSAENOBUFS.  Dropping those packets
+     *   makes TCP see loss and collapse cwnd, which is especially harmful
+     *   for the forward (TAP->UDP) direction.  A short write-ready poll
+     *   keeps the stall bounded while giving the kernel time to drain the
+     *   SO_SNDBUF backlog. */
     for( int retry = 0; retry < 10 && sent < 0; retry++ )
     {
-        int err = WSAGetLastError();
-        if( err != WSAEWOULDBLOCK && err != WSAENOBUFS )
+#ifdef _WIN32
+        int error = WSAGetLastError();
+        if( error != WSAEWOULDBLOCK && error != WSAENOBUFS )
             break;
-        struct timeval tv = { 0, 1000 };
+        struct timeval tv = { 0, 1000 }; /* 1 ms */
         fd_set wfds;
         FD_ZERO(&wfds);
         FD_SET(fd, &wfds);
-        select((int)fd + 1, NULL, &wfds, NULL, &tv);
-        sent = sendto( fd, buf, len, 0,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
+        if( select(0, NULL, &wfds, NULL, &tv) <= 0 )
+            break;
 #else
-    for( int retry = 0; retry < 50 && sent < 0; retry++ )
-    {
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
         usleep(1000);
-        sent = sendto( fd, buf, len, 0,
+#endif
+        sent = sendto( fd, buf, len, 0/*flags*/,
                        (struct sockaddr*) &peer_addr, addr_len );
     }
-#endif
 
     if ( sent < 0 )
     {
@@ -2804,10 +2804,10 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
 /** Process one raw Ethernet frame from TAP RX: apply multicast drop,
  *  then try bypass fast-path, otherwise send via n2n overlay.
  *  This is the EXACT same downstream path readFromTAPSocket uses,
- *  extracted to a helper so it can be called from:
- *    (1) the Windows main loop when read_event fires (draining the
- *        frames queued by the background TAP read thread via tuntap_read),
- *    (2) readFromTAPSocket() on non-Windows platforms. */
+ *  extracted to a helper so we can call it from three places:
+ *    (1) pre-loop sync-drain of tuntap_read_begin_overlapped,
+ *    (2) after WaitForSingleObject returns on overlap_read.hEvent,
+ *    (3) sync-completion loop after re-submitting a read. */
 static inline void process_tap_rx_frame(n2n_edge_t *eee,
                                         const uint8_t *buf, ssize_t len) {
     macstr_t mac_buf;
@@ -5947,23 +5947,43 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    /* Background TAP reader thread (win32/wintap.c) continuously submits
-     *   overlapped ReadFile IRPs and queues completed frames into a ring
-     *   buffer, signalling read_event.  The main loop below waits on that
-     *   event and drains the queue via tuntap_read() — the read path is
-     *   now fully decoupled from the main loop (symmetric to the write
-     *   thread), so a fresh IRP is always in flight and the per-frame
-     *   "submit → wait → process → re-submit" gap on the send path is gone.
+    /* Single-threaded TAP reader using OVERLAPPED I/O —
+     *   architecture 100% aligned with cnn2n.  No tunReadThread,
+     *   no ring buffer, no cross-thread events.  TAP reads are
+     *   submitted as overlapped IRPs, completions are signalled
+     *   via overlap_read.hEvent directly to the main loop's
+     *   WaitForSingleObject, and frames flow straight from
+     *   tuntap_dev.read_buf → bypass_tap_forward → send_packet2net
+     *   on the SAME thread with zero intermediate queueing.  If
+     *   send_packet2net blocks on a full SO_SNDBUF, no further
+     *   TAP reads are submitted until it unblocks, so the TAP
+     *   driver's RX ring fills up and the user-space TCP that is
+     *   writing to the TAP gets back-pressure automatically —
+     *   zero parameters, fully auto-tuning to the real uplink
+     *   capacity just like cnn2n.
      *
-     *   Back-pressure is preserved: when the read queue fills up the read
-     *   thread blocks, the TAP driver RX ring fills up and the user-space
-     *   TCP writing to the TAP is throttled automatically. */
-    if (eee->device.read_event == NULL ||
-        eee->device.device_handle == INVALID_HANDLE_VALUE)
+     *   Pre-submit the first overlapped read before entering the
+     *   loop, draining any synchronously-completed frames (driver
+     *   backlog on startup).  On any transient error we silently
+     *   skip; the per-tick lazy-init block inside the loop will
+     *   re-try the submission so we never get stuck with no IRP
+     *   in flight. */
+    if (eee->device.overlap_read.hEvent != NULL &&
+        eee->device.device_handle != INVALID_HANDLE_VALUE)
+    {
+        ssize_t slen;
+        while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+            process_tap_rx_frame(eee, eee->device.read_buf, slen);
+        }
+        traceEvent(TRACE_DEBUG,
+                   "TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
+                   (unsigned)eee->device.read_pending, (int)slen);
+    }
+    else
     {
         traceEvent(TRACE_WARNING,
-                   "TAP read thread unavailable (read_event=%p device_handle=%p)",
-                   eee->device.read_event,
+                   "TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
+                   eee->device.overlap_read.hEvent,
                    (void*)(UINT_PTR)eee->device.device_handle);
     }
 #endif
@@ -6034,21 +6054,19 @@ static int run_loop(n2n_edge_t * eee )
          *   and 0-10 ms added ingress latency on non-TAP fds is
          *   invisible on any real WAN RTT.  Completely generic.
          *
-         *   Windows: background read thread (win32/wintap.c) continuously
-         *            submits overlapped ReadFile IRPs and queues completed
-         *            frames; we wait on read_event (auto-reset, fires when
-         *            >= 1 frame is queued) and combine that with a 10 ms
+         *   Windows: single-threaded OVERLAPPED I/O — no separate tunReadThread.
+         *            We block on overlap_read.hEvent (the single kernel
+         *            notification that TAP driver has completed a read
+         *            IRP we submitted) and combine that with a 10 ms
          *            upper bound for polling all ingress socket fds.
-         *            Architecture:
-         *              read thread → tuntap_read_enqueue → SetEvent(read_event)
-         *              main loop: WFSO → read_event? → drain via tuntap_read
-         *                → process → send_packet2net
+         *            Architecture = cnn2n exactly:
+         *              WFSO → TAP frame ready? → process → send_packet2net
          *                → if send_packet2net blocks on SO_SNDBUF full,
-         *                  the drain stalls here; the read queue fills up,
-         *                  the read thread stops reading, the TAP driver RX
-         *                  ring fills up → user-space TCP writing to TAP
-         *                  gets blocked → TCP cwnd auto-tunes to real
-         *                  uplink capacity (back-pressure preserved).
+         *                  we stall here; further TAP reads won't be
+         *                  submitted until it unblocks → TAP driver RX
+         *                  ring fills up → user-space TCP writing to
+         *                  TAP gets blocked → TCP cwnd auto-tunes to
+         *                  real uplink capacity.
          *            After every wakeup (signal or timeout) we run
          *            select(timeout=0) on the same fd sets as Linux,
          *            so UDP/mgmt/WS/bypass TCP fds never need WinSock
@@ -6075,7 +6093,7 @@ static int run_loop(n2n_edge_t * eee )
              *   pass below — exactly the same FD walk as Linux. */
             HANDLE handles[3];
             int n_handles = 0;
-            HANDLE h_tap = eee->device.read_event;   /* frames queued by read thread */
+            HANDLE h_tap = eee->device.overlap_read.hEvent;
             if (h_tap != NULL) handles[n_handles++] = h_tap;       /* [0] */
             if (eee->device.udp_sock_event)  handles[n_handles++] = eee->device.udp_sock_event;  /* [1] */
             if (eee->device.udp_sock6_event) handles[n_handles++] = eee->device.udp_sock6_event; /* [2] */
@@ -6112,24 +6130,34 @@ static int run_loop(n2n_edge_t * eee )
                 (void)0;
             }
 
-            /* TAP RX harvesting: when read_event (index 0) fires, drain
-             *   the frames the read thread queued.  read_event is
-             *   auto-reset; a SetEvent landing after WFSO consumed it
-             *   leaves the event signalled, causing at most one extra
-             *   empty pass — harmless. */
+            /* TAP RX harvesting: same careful rules as before.
+             *   - Only touch overlap_read if TAP event fired (index 0).
+             *   - GetOverlappedResult(bWait=FALSE) on a still-pending
+             *     IRP fails with ERROR_IO_INCOMPLETE — never do that.
+             *   - On async completion, ResetEvent + harvest + resubmit,
+             *     draining any synchronously-completed frames. */
             bool tap_signalled = (wfso_rc != WAIT_TIMEOUT &&
                                   n_handles > 0 &&
                                   (wfso_rc - WAIT_OBJECT_0) == 0);
-            if (tap_signalled) {
-                uint8_t eth_pkt[N2N_PKT_BUF_SIZE];
-                ssize_t len;
-                while ((len = tuntap_read(&eee->device, eth_pkt,
-                                          N2N_PKT_BUF_SIZE)) > 0) {
-                    process_tap_rx_frame(eee, eth_pkt, len);
+            if (tap_signalled && eee->device.read_pending) {
+                ResetEvent(eee->device.overlap_read.hEvent);
+                ssize_t len = tuntap_read_complete_overlapped(&eee->device);
+                if (len > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, len);
+                }
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                }
+            } else if (!eee->device.read_pending) {
+                /* No IRP in flight (lost one, or first tick). Resubmit. */
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
                 }
             }
-            /* else: WFSO timed out (or another event fired) — the read
-             *       thread keeps the IRP pipeline fed; nothing to do. */
+            /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
+             *       IRP is still pending — leave it. */
 
             /* Zero-timeout select walk so UDP/mgmt/WS/bypass fds get
              *   serviced without blocking.  Zero timeout is correct:
@@ -6505,9 +6533,10 @@ static int run_loop(n2n_edge_t * eee )
 
 cleanup:
     eee->keep_running = 0;
-    /* Close TAP first: tuntap_close() signals read_event and cancels any
-     *   pending overlapped read via CancelIo(), so the background read
-     *   thread (and any WFSO on read_event) wakes up cleanly. */
+    /* Close TAP first: any pending overlapped read is cancelled by
+     *   CancelIo() inside tuntap_close(), which causes the WFSO
+     *   overlap_read.hEvent to fire and lets the main loop (if still
+     *   alive) wake up cleanly. */
     tuntap_close(&(eee->device));
 
     send_deregister( eee, &(eee->supernode));

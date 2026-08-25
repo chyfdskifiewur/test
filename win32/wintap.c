@@ -12,7 +12,6 @@
 /* TODO error messages using the same framework as the rest of the program */
 
 static DWORD WINAPI tuntap_write_thread(LPVOID lpArg);
-static DWORD WINAPI tuntap_read_thread(LPVOID lpArg);
 
 void initWin32() {
     WSADATA wsaData;
@@ -368,28 +367,6 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
         exit(0);
     }
 
-    /* Initialize read queue and background read thread (symmetric to write path).
-     *   The read thread continuously submits overlapped ReadFile IRPs so the
-     *   main loop never has to block on TAP reads, mirroring the decoupled
-     *   write path and lifting the per-frame IRP gap that limited uplink. */
-    InitializeCriticalSection(&device->read_lock);
-    device->read_queue_head = 0;
-    device->read_queue_tail = 0;
-    device->read_pending = 0;
-    device->read_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    device->read_space_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    device->read_thread_running = true;
-    device->read_thread = CreateThread(NULL, 0, tuntap_read_thread, (void*)device, 0, NULL);
-    if (!device->read_event || !device->read_space_event || !device->read_thread) {
-        device->read_thread_running = false;
-        if (device->read_event) CloseHandle(device->read_event);
-        if (device->read_space_event) CloseHandle(device->read_space_event);
-        if (device->read_thread) CloseHandle(device->read_thread);
-        DeleteCriticalSection(&device->read_lock);
-        traceEvent(TRACE_ERROR, "Failed to create TAP read thread!");
-        exit(0);
-    }
-
     return 0;
 }
 
@@ -430,6 +407,37 @@ static DWORD WINAPI tuntap_write_thread(LPVOID lpArg) {
     return 0;
 }
 
+/* ************************************************ */
+
+ssize_t tuntap_read(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
+    uint32_t read_size = 0, last_err;
+
+    ResetEvent(tuntap->overlap_read.hEvent);
+    if (ReadFile(tuntap->device_handle, buf, (uint32_t) len, &read_size, &tuntap->overlap_read)) {
+        return (ssize_t) read_size;
+    }
+    switch (last_err = GetLastError()) {
+    case ERROR_IO_PENDING:
+        WaitForSingleObject(tuntap->overlap_read.hEvent, INFINITE);
+        if (!GetOverlappedResult(tuntap->device_handle, &tuntap->overlap_read, &read_size, FALSE)) {
+            DWORD last_err2 = GetLastError();
+            if (last_err2 != ERROR_OPERATION_ABORTED && last_err2 != ERROR_INVALID_HANDLE) {
+                W32_ERROR(last_err2, error)
+                traceEvent(TRACE_ERROR, "GetOverlappedResult TAP: %ls", error);
+                W32_ERROR_FREE(error)
+            }
+            return -1;
+        }
+        return (ssize_t) read_size;
+    default: {
+        /* Non-critical errors are normal when the TAP device is idle
+         * or during shutdown. The caller handles this silently. */
+        break;
+    }
+    }
+
+  return -1;
+}
 /* ************************************************ */
 
 /* Start an overlapped (non-blocking) TAP read operation.
@@ -523,90 +531,6 @@ ssize_t tuntap_read_complete_overlapped(struct tuntap_dev *tuntap) {
 }
 /* ************************************************ */
 
-/* Queue a completed TAP frame into the read ring (back-pressured).
- *   When the queue is full the read thread stops reading; the TAP driver's
- *   RX ring then fills up and the user-space TCP writing to the TAP gets
- *   throttled — preserving the auto-tuning back-pressure of the old
- *   single-IRP design while allowing continuous pre-fetch. */
-static void tuntap_read_enqueue(struct tuntap_dev *tuntap,
-                                const uint8_t *buf, size_t len) {
-    while (tuntap->read_thread_running) {
-        EnterCriticalSection(&tuntap->read_lock);
-        int next_tail = (tuntap->read_queue_tail + 1) % N2N_READ_QUEUE_SIZE;
-        if (next_tail != tuntap->read_queue_head) {
-            struct win_read_packet *pkt = &tuntap->read_queue[tuntap->read_queue_tail];
-            if (len > sizeof(pkt->buf)) len = sizeof(pkt->buf);
-            memcpy(pkt->buf, buf, len);
-            pkt->len = len;
-            tuntap->read_queue_tail = next_tail;
-            LeaveCriticalSection(&tuntap->read_lock);
-            SetEvent(tuntap->read_event);
-            return;
-        }
-        LeaveCriticalSection(&tuntap->read_lock);
-        /* Queue full — wait for the main loop to free a slot */
-        WaitForSingleObject(tuntap->read_space_event, 10);
-    }
-}
-
-/* Background TAP reader thread.
- *   Continuously submits overlapped ReadFile IRPs, so a new read is
- *   always in flight the moment the previous one completes — no
- *   per-frame gap on the send path.  Completed frames are queued via
- *   tuntap_read_enqueue and consumed by the main loop through
- *   tuntap_read() when read_event fires. */
-static DWORD WINAPI tuntap_read_thread(LPVOID lpArg) {
-    struct tuntap_dev *tuntap = (struct tuntap_dev *)lpArg;
-
-    while (tuntap->read_thread_running) {
-        ssize_t r = tuntap_read_begin_overlapped(tuntap);
-        if (r > 0) {
-            /* Synchronous completion — frame already in read_buf.
-             *   Immediately submit the next read on the next iteration. */
-            tuntap_read_enqueue(tuntap, tuntap->read_buf, (size_t)r);
-            continue;
-        }
-        if (r == 0) {
-            /* Async IRP pending — wait for completion, then harvest. */
-            WaitForSingleObject(tuntap->overlap_read.hEvent, INFINITE);
-            if (!tuntap->read_thread_running) break;
-            r = tuntap_read_complete_overlapped(tuntap);
-            if (r > 0)
-                tuntap_read_enqueue(tuntap, tuntap->read_buf, (size_t)r);
-            continue;
-        }
-        /* r < 0 — transient error (idle or shutdown).  Brief pause, retry. */
-        if (!tuntap->read_thread_running) break;
-        WaitForSingleObject(tuntap->read_space_event, 1);
-    }
-
-    return 0;
-}
-/* ************************************************ */
-
-ssize_t tuntap_read(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
-    EnterCriticalSection(&tuntap->read_lock);
-    int head = tuntap->read_queue_head;
-    int tail = tuntap->read_queue_tail;
-    if (head == tail) {
-        /* No frame available (non-blocking, like the other platforms). */
-        LeaveCriticalSection(&tuntap->read_lock);
-        return -1;
-    }
-
-    struct win_read_packet *pkt = &tuntap->read_queue[head];
-    size_t n = pkt->len;
-    if (n > len) n = len;
-    memcpy(buf, pkt->buf, n);
-    tuntap->read_queue_head = (head + 1) % N2N_READ_QUEUE_SIZE;
-    LeaveCriticalSection(&tuntap->read_lock);
-
-    /* Notify the read thread that a slot was freed. */
-    SetEvent(tuntap->read_space_event);
-    return (ssize_t)n;
-}
-/* ************************************************ */
-
 ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) {
     if (!tuntap->write_thread_running)
         return -1;
@@ -654,44 +578,12 @@ void tuntap_close(struct tuntap_dev *tuntap) {
     }
     DeleteCriticalSection(&tuntap->write_lock);
 
-    /* Stop read thread: clear the running flag and wake it.  The pending
-     *   overlapped read is cancelled by CancelIo() below so the thread can
-     *   exit its WaitForSingleObject. */
-    tuntap->read_thread_running = false;
-    if (tuntap->read_event) {
-        SetEvent(tuntap->read_event);
-    }
-    if (tuntap->read_space_event) {
-        SetEvent(tuntap->read_space_event);
-    }
-
     if (tuntap->device_handle != INVALID_HANDLE_VALUE) {
-        /* Cancel pending I/O so the read thread's overlapped read completes
-         * with ERROR_OPERATION_ABORTED and the thread can exit.  Keep the
-         * handle open until the read thread has fully stopped, so it can
-         * never issue a ReadFile against a closed handle. */
+        /* Cancel pending I/O to wake up the TUN reader thread during shutdown. */
         CancelIo(tuntap->device_handle);
-    }
-
-    if (tuntap->read_thread) {
-        WaitForSingleObject(tuntap->read_thread, 2000);
-        CloseHandle(tuntap->read_thread);
-        tuntap->read_thread = NULL;
-    }
-    if (tuntap->device_handle != INVALID_HANDLE_VALUE) {
         CloseHandle(tuntap->device_handle);
         tuntap->device_handle = INVALID_HANDLE_VALUE;
     }
-    if (tuntap->read_event) {
-        CloseHandle(tuntap->read_event);
-        tuntap->read_event = NULL;
-    }
-    if (tuntap->read_space_event) {
-        CloseHandle(tuntap->read_space_event);
-        tuntap->read_space_event = NULL;
-    }
-    DeleteCriticalSection(&tuntap->read_lock);
-
     if (tuntap->overlap_read.hEvent) {
         CloseHandle(tuntap->overlap_read.hEvent);
         tuntap->overlap_read.hEvent = NULL;
@@ -735,39 +627,9 @@ int tuntap_restart( tuntap_dev* device ) {
         device->write_event = NULL;
     }
 
-    /* Stop read thread before closing device handle */
-    device->read_thread_running = false;
-    if (device->read_event) {
-        SetEvent(device->read_event);
-    }
-    if (device->read_space_event) {
-        SetEvent(device->read_space_event);
-    }
-
-    if (device->device_handle != INVALID_HANDLE_VALUE) {
-        /* Cancel pending I/O so the read thread's overlapped read completes
-         * with ERROR_OPERATION_ABORTED and the thread can exit.  Keep the
-         * handle open until the read thread has fully stopped, so it can
-         * never issue a ReadFile against a closed handle. */
-        CancelIo(device->device_handle);
-    }
-
-    if (device->read_thread) {
-        WaitForSingleObject(device->read_thread, 2000);
-        CloseHandle(device->read_thread);
-        device->read_thread = NULL;
-    }
     if (device->device_handle != INVALID_HANDLE_VALUE) {
         CloseHandle(device->device_handle);
         device->device_handle = INVALID_HANDLE_VALUE;
-    }
-    if (device->read_event) {
-        CloseHandle(device->read_event);
-        device->read_event = NULL;
-    }
-    if (device->read_space_event) {
-        CloseHandle(device->read_space_event);
-        device->read_space_event = NULL;
     }
 
     ResetEvent(device->overlap_write.hEvent);
@@ -841,23 +703,6 @@ int tuntap_restart( tuntap_dev* device ) {
         if (device->write_event) CloseHandle(device->write_event);
         if (device->write_thread) CloseHandle(device->write_thread);
         traceEvent(TRACE_ERROR, "Failed to re-create TAP write thread!");
-        return -1;
-    }
-
-    /* Restart read thread after reopening device */
-    device->read_queue_head = 0;
-    device->read_queue_tail = 0;
-    device->read_pending = 0;
-    device->read_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    device->read_space_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    device->read_thread_running = true;
-    device->read_thread = CreateThread(NULL, 0, tuntap_read_thread, (void*)device, 0, NULL);
-    if (!device->read_event || !device->read_space_event || !device->read_thread) {
-        device->read_thread_running = false;
-        if (device->read_event) CloseHandle(device->read_event);
-        if (device->read_space_event) CloseHandle(device->read_space_event);
-        if (device->read_thread) CloseHandle(device->read_thread);
-        traceEvent(TRACE_ERROR, "Failed to re-create TAP read thread!");
         return -1;
     }
 
