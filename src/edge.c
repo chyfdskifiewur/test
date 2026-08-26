@@ -958,37 +958,49 @@ static uint64_t tcp_kcp_monotonic_ms(void)
 }
 
 /** KCP output callback: called when KCP needs to send a segment via UDP.
- *  The segment is encrypted with the n2n transform and sent as a regular
- *  n2n compact PACKET (MSG_TYPE_KCP_DATA). */
+ *  The segment is wrapped in a dummy ethernet frame with ethertype 0x4B43
+ *  ("KC"), encrypted, and sent as a regular MSG_TYPE_PACKET.  The supernode
+ *  forwards it (no special message type needed), and the receiver detects
+ *  the KCP marker by checking the ethertype of the decrypted payload. */
 static int tcp_kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
 {
     n2n_edge_t *eee = (n2n_edge_t *)user;
     n2n_common_t cmn;
+    n2n_PACKET_t pkt;
     uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-    size_t idx = 0;
+    uint8_t eth_frame[N2N_PKT_BUF_SIZE];
+    size_t idx = 0, eidx = 0;
     size_t tx_transop_idx = edge_choose_tx_transop(eee);
 
     if (tx_transop_idx >= N2N_MAX_TRANSFORMS || !eee->transop[tx_transop_idx].fwd)
         return len; /* pretend success, KCP will retry */
 
-    /* Build compact header with MSG_TYPE_KCP_DATA */
+    /* Wrap KCP segment in an ethernet frame with marker ethertype 0x4B43 */
+    memset(eth_frame + eidx, 0xFF, 6); eidx += 6; /* dst MAC (broadcast) */
+    memcpy(eth_frame + eidx, eee->device.mac_addr, 6); eidx += 6; /* src MAC */
+    eth_frame[eidx++] = 0x4B; eth_frame[eidx++] = 0x43; /* ethertype = "KC" */
+    memcpy(eth_frame + eidx, buf, (size_t)len); eidx += (size_t)len;
+
+    /* Build a regular MSG_TYPE_PACKET (supernode forwards it like any other) */
     memset(&cmn, 0, sizeof(cmn));
     cmn.ttl = N2N_DEFAULT_TTL;
-    cmn.pc = MSG_TYPE_KCP_DATA;
+    cmn.pc = MSG_TYPE_PACKET;
     cmn.flags = 0;
+    memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
 
-    /* Use broadcast MAC as placeholder — real dest is looked up by peer */
-    uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    encode_compact_header(pktbuf, &idx, &cmn, bcast_mac, NULL);
+    memset(&pkt, 0, sizeof(pkt));
+    memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
+    memcpy(pkt.dstMac, eth_frame, N2N_MAC_SIZE); /* dst MAC = broadcast */
+    pkt.sock.family = 0;
+    pkt.transform = eee->transop[tx_transop_idx].transform_id;
 
-    /* Encrypt the KCP segment */
+    encode_PACKET(pktbuf, &idx, &cmn, &pkt);
     idx += eee->transop[tx_transop_idx].fwd(&(eee->transop[tx_transop_idx]),
                                              pktbuf + idx, N2N_PKT_BUF_SIZE - idx,
-                                             (const uint8_t *)buf, (size_t)len, bcast_mac);
+                                             eth_frame, eidx, eth_frame);
     ++(eee->transop[tx_transop_idx].tx_cnt);
 
-    /* Send to all peers (broadcast to the n2n network) */
-    send_PACKET(eee, bcast_mac, pktbuf, idx);
+    send_PACKET(eee, eth_frame, pktbuf, idx);
 
     return len;
 }
@@ -3183,6 +3195,25 @@ static int handle_PACKET( n2n_edge_t * eee,
                 }
             }
 
+            /* Check for KCP data marker ethertype 0x4B43 ("KC").
+             * KCP segments are wrapped in a dummy ethernet frame by
+             * tcp_kcp_output and sent as MSG_TYPE_PACKET.  The supernode
+             * forwards them like any other packet, and we detect them
+             * here by the ethertype instead of using a separate message
+             * type (which the supernode would drop). */
+            if (eee->tcp_kcp && eth_size >= 14)
+            {
+                uint16_t kcp_etype = (eth_payload[12] << 8) | eth_payload[13];
+                if (kcp_etype == 0x4B43)
+                {
+                    ikcp_input(eee->tcp_kcp, (const char *)(eth_payload + 14),
+                               (long)(eth_size - 14));
+                    tcp_kcp_drain(eee);
+                    retval = 0;
+                    return retval;
+                }
+            }
+
             data_sent_len = tuntap_write(&(eee->device), eth_payload, eth_size);
             traceEvent(TRACE_DEBUG, "handle_PACKET: tuntap_write done, len=%d", (signed int)data_sent_len);
 
@@ -3862,30 +3893,6 @@ process_n2n_packet:
 
         msg_type = cmn.pc;
         from_supernode = cmn.flags & N2N_FLAGS_FROM_SUPERNODE;
-
-        if ( msg_type == MSG_TYPE_KCP_DATA )
-        {
-            /* KCP data: decrypt and feed to KCP session */
-            if (eee->tcp_kcp && idx < (size_t)recvlen)
-            {
-                size_t tx_idx = edge_choose_tx_transop(eee);
-                if (tx_idx < N2N_MAX_TRANSFORMS && eee->transop[tx_idx].rev)
-                {
-                    uint8_t decbuf[2048];
-                    uint8_t zero_mac[6] = {0};
-                    ssize_t dlen = (ssize_t)eee->transop[tx_idx].rev(
-                        &(eee->transop[tx_idx]), decbuf, sizeof(decbuf),
-                        udp_buf + idx, (size_t)(recvlen - (ssize_t)idx), zero_mac);
-                    if (dlen > 0)
-                    {
-                        ++(eee->transop[tx_idx].rx_cnt);
-                        ikcp_input(eee->tcp_kcp, (const char *)decbuf, (long)dlen);
-                        tcp_kcp_drain(eee);
-                    }
-                }
-            }
-            return 0;
-        }
 
         if ( msg_type != MSG_TYPE_PACKET )
             return 0;
