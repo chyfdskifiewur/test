@@ -739,6 +739,11 @@ static void edge_deinit(n2n_edge_t * eee)
     clear_peer_list( &(eee->pending_peers) );
     clear_peer_list( &(eee->known_peers) );
 
+    if (eee->tcp_kcp) {
+        ikcp_release(eee->tcp_kcp);
+        eee->tcp_kcp = NULL;
+    }
+
     (eee->transop[N2N_TRANSOP_TF_IDX].deinit)(&eee->transop[N2N_TRANSOP_TF_IDX]);
     (eee->transop[N2N_TRANSOP_NULL_IDX].deinit)(&eee->transop[N2N_TRANSOP_NULL_IDX]);
     (eee->transop[N2N_TRANSOP_AESCBC_IDX].deinit)(&eee->transop[N2N_TRANSOP_AESCBC_IDX]);
@@ -929,6 +934,76 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     }
 
     return sent;
+}
+
+/* ===== KCP TCP transport for reliable tunnel-mode TCP forwarding ===== */
+
+/** Monotonic millisecond clock for KCP timing. */
+static uint64_t tcp_kcp_monotonic_ms(void)
+{
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+/** KCP output callback: called when KCP needs to send a segment via UDP.
+ *  The segment is encrypted with the n2n transform and sent as a regular
+ *  n2n compact PACKET (MSG_TYPE_KCP_DATA). */
+static int tcp_kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
+{
+    n2n_edge_t *eee = (n2n_edge_t *)user;
+    n2n_common_t cmn;
+    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+    size_t idx = 0;
+    size_t tx_transop_idx = edge_choose_tx_transop(eee);
+
+    if (tx_transop_idx >= N2N_MAX_TRANSFORMS || !eee->transop[tx_transop_idx].fwd)
+        return len; /* pretend success, KCP will retry */
+
+    /* Build compact header with MSG_TYPE_KCP_DATA */
+    memset(&cmn, 0, sizeof(cmn));
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = MSG_TYPE_KCP_DATA;
+    cmn.flags = 0;
+
+    /* Use broadcast MAC as placeholder — real dest is looked up by peer */
+    uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    encode_compact_header(pktbuf, &idx, &cmn, bcast_mac, NULL);
+
+    /* Encrypt the KCP segment */
+    idx += eee->transop[tx_transop_idx].fwd(&(eee->transop[tx_transop_idx]),
+                                             pktbuf + idx, N2N_PKT_BUF_SIZE - idx,
+                                             (const uint8_t *)buf, (size_t)len, bcast_mac);
+    ++(eee->transop[tx_transop_idx].tx_cnt);
+
+    /* Send to all peers (broadcast to the n2n network) */
+    send_PACKET(eee, bcast_mac, pktbuf, idx);
+
+    return len;
+}
+
+/** Drain received KCP data and write to TAP. Should be called periodically
+ *  from the main loop after ikcp_input(). Returns number of frames written. */
+static int tcp_kcp_drain(n2n_edge_t *eee)
+{
+    int n = 0;
+    if (!eee->tcp_kcp)
+        return 0;
+    while (n < 64) {
+        int peek = ikcp_peeksize(eee->tcp_kcp);
+        if (peek <= 0) break;
+        uint8_t *buf = eee->tcp_kcp_buf;
+        int ret = ikcp_recv(eee->tcp_kcp, (char *)buf, (int)sizeof(eee->tcp_kcp_buf));
+        if (ret <= 0) break;
+        ssize_t wlen = tuntap_write(&eee->device, buf, (size_t)ret);
+        if (wlen != ret) break;
+        ++n;
+    }
+    return n;
 }
 
 /** Select the correct UDP socket based on destination address family */
@@ -2819,6 +2894,21 @@ static inline void process_tap_rx_frame(n2n_edge_t *eee,
         return;
     }
 
+    /* Try KCP transport for TCP packets (reliable, avoids cwnd collapse
+     * from UDP loss).  Only IPv4 TCP for now. */
+    if (eee->tcp_kcp &&
+        len >= 34 &&                          /* eth(14) + ip(20) min */
+        buf[12] == 0x08 && buf[13] == 0x00 && /* IPv4 */
+        (buf[14 + 9] & 0x3F) == 6)            /* TCP protocol */
+    {
+        if (ikcp_send(eee->tcp_kcp, (const char *)buf, (int)len) < 0) {
+            traceEvent(TRACE_DEBUG, "KCP ikcp_send failed, falling back to n2n");
+            goto normal_path;
+        }
+        return;
+    }
+
+normal_path:
     /* bypass_has_peers already handles NULL ctx (returns 0).  The
      *   || short-circuit guarantees bypass_tap_forward is never called
      *   with a NULL ctx, but we guard it explicitly anyway so future
@@ -3765,6 +3855,30 @@ process_n2n_packet:
 
         msg_type = cmn.pc;
         from_supernode = cmn.flags & N2N_FLAGS_FROM_SUPERNODE;
+
+        if ( msg_type == MSG_TYPE_KCP_DATA )
+        {
+            /* KCP data: decrypt and feed to KCP session */
+            if (eee->tcp_kcp && idx < (size_t)recvlen)
+            {
+                size_t tx_idx = edge_choose_tx_transop(eee);
+                if (tx_idx < N2N_MAX_TRANSFORMS && eee->transop[tx_idx].rev)
+                {
+                    uint8_t decbuf[2048];
+                    uint8_t zero_mac[6] = {0};
+                    ssize_t dlen = (ssize_t)eee->transop[tx_idx].rev(
+                        &(eee->transop[tx_idx]), decbuf, sizeof(decbuf),
+                        udp_buf + idx, (size_t)(recvlen - (ssize_t)idx), zero_mac);
+                    if (dlen > 0)
+                    {
+                        ++(eee->transop[tx_idx].rx_cnt);
+                        ikcp_input(eee->tcp_kcp, (const char *)decbuf, (long)dlen);
+                        tcp_kcp_drain(eee);
+                    }
+                }
+            }
+            return 0;
+        }
 
         if ( msg_type != MSG_TYPE_PACKET )
             return 0;
@@ -5874,6 +5988,28 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         }
     }
 
+    /* Initialize KCP for reliable TCP transport in tunnel mode */
+    {
+        eee.tcp_kcp = ikcp_create(0x4B435050, &eee);
+        if (eee.tcp_kcp) {
+            ikcp_setoutput(eee.tcp_kcp, tcp_kcp_output);
+            ikcp_nodelay(eee.tcp_kcp, 1, 10, 2, 1);
+            ikcp_wndsize(eee.tcp_kcp, 256, 256);
+            ikcp_setmtu(eee.tcp_kcp, 1500);
+#ifdef _WIN32
+            eee.tcp_kcp_start = (uint64_t)GetTickCount64();
+#else
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            eee.tcp_kcp_start = (uint64_t)_ts.tv_sec * 1000 +
+                                 (uint64_t)_ts.tv_nsec / 1000000;
+#endif
+            traceEvent(TRACE_NORMAL, "KCP TCP transport initialized, conv=0x%08x", 0x4B435050);
+        } else {
+            traceEvent(TRACE_WARNING, "KCP init failed, TCP tunnel transport disabled");
+        }
+    }
+
     traceEvent(TRACE_NORMAL, "Edge started");
 
     setup_upnp(&eee, local_port);
@@ -6298,6 +6434,12 @@ static int run_loop(n2n_edge_t * eee )
         }
 
         /* Finished processing select data. */
+
+        /* Drive KCP state machine: retransmission, congestion control, etc.
+         * Must be called every tick (10ms) to advance KCP's internal timer. */
+        if (eee->tcp_kcp) {
+            ikcp_update(eee->tcp_kcp, tcp_kcp_monotonic_ms());
+        }
 
         update_supernode_reg(eee, nowTime);
         PEERS_LOCK(eee);
