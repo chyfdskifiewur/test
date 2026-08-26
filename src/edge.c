@@ -936,6 +936,13 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     return sent;
 }
 
+/* Forward declarations for functions used by KCP transport below */
+static size_t edge_choose_tx_transop( const n2n_edge_t * eee );
+static int send_PACKET( n2n_edge_t * eee,
+                        n2n_mac_t dstMac,
+                        const uint8_t * pktbuf,
+                        size_t pktlen );
+
 /* ===== KCP TCP transport for reliable tunnel-mode TCP forwarding ===== */
 
 /** Monotonic millisecond clock for KCP timing. */
