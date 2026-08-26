@@ -518,10 +518,6 @@ struct n2n_edge
     n2n_sock_t          last_p2p_log_addr;
     uint8_t             last_psp_log_mac[N2N_MAC_SIZE];
 
-    /* Pending TAP write buffer — non-blocking retry when TAP driver is congested */
-    uint8_t             tap_pending_buf[2048];
-    int                 tap_pending_len;
-
     /* Bypass module */
     bypass_context_t   *bp;
     uint16_t            bp_proxy_port;
