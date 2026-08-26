@@ -2913,21 +2913,6 @@ static inline void process_tap_rx_frame(n2n_edge_t *eee,
         return;
     }
 
-    /* Try KCP transport for TCP packets (reliable, avoids cwnd collapse
-     * from UDP loss).  Only IPv4 TCP for now. */
-    if (eee->tcp_kcp &&
-        len >= 34 &&                          /* eth(14) + ip(20) min */
-        buf[12] == 0x08 && buf[13] == 0x00 && /* IPv4 */
-        (buf[14 + 9] & 0x3F) == 6)            /* TCP protocol */
-    {
-        if (ikcp_send(eee->tcp_kcp, (const char *)buf, (int)len) < 0) {
-            traceEvent(TRACE_DEBUG, "KCP ikcp_send failed, falling back to n2n");
-            goto normal_path;
-        }
-        return;
-    }
-
-normal_path:
     /* bypass_has_peers already handles NULL ctx (returns 0).  The
      *   || short-circuit guarantees bypass_tap_forward is never called
      *   with a NULL ctx, but we guard it explicitly anyway so future
