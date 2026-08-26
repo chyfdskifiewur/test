@@ -6145,27 +6145,42 @@ static int run_loop(n2n_edge_t * eee )
                 if (len > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, len);
                 }
-                /* Cap the number of synchronously-completed frames we drain
-                 *   in one go.  During a large TCP upload the TAP driver can
-                 *   return many frames synchronously; if we drain them all
-                 *   we starve the UDP socket and ACKs arrive late, keeping the
-                 *   TCP send window small.  A small batch keeps latency low
-                 *   while still amortising system-call overhead. */
-                int tap_batch = 0;
+                /* Drain synchronously-completed frames, but after each
+                 *   frame check for incoming UDP data.  This prevents ACK
+                 *   starvation: during a large TCP upload the TAP driver
+                 *   can return many frames synchronously; if we drain them
+                 *   all in one go we delay processing TCP ACKs, which
+                 *   inflates the sender's RTT estimate and suppresses
+                 *   single-stream cwnd growth.  Interleaving one UDP
+                 *   check per TAP frame keeps ACK latency bounded to
+                 *   roughly one frame's encrypt+sendto time (~50µs). */
                 ssize_t slen;
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                    if (++tap_batch >= 32)
-                        break;
+                    /* Quick non-blocking check for incoming UDP data */
+                    struct timeval _zt = { 0, 0 };
+                    fd_set _rd;
+                    FD_ZERO(&_rd);
+                    if (eee->udp_sock >= 0) {
+                        FD_SET(eee->udp_sock, &_rd);
+                        if (select(eee->udp_sock + 1, &_rd, NULL, NULL, &_zt) > 0)
+                            readFromIPSocket(eee, eee->udp_sock);
+                    }
                 }
             } else if (!eee->device.read_pending) {
-                /* No IRP in flight (lost one, or first tick). Resubmit. */
-                int tap_batch = 0;
+                /* No IRP in flight (lost one, or first tick). Resubmit.
+                 *   Same interleaving as above. */
                 ssize_t slen;
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                    if (++tap_batch >= 32)
-                        break;
+                    struct timeval _zt = { 0, 0 };
+                    fd_set _rd;
+                    FD_ZERO(&_rd);
+                    if (eee->udp_sock >= 0) {
+                        FD_SET(eee->udp_sock, &_rd);
+                        if (select(eee->udp_sock + 1, &_rd, NULL, NULL, &_zt) > 0)
+                            readFromIPSocket(eee, eee->udp_sock);
+                    }
                 }
             }
             /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
