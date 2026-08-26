@@ -453,6 +453,24 @@ int tuntap_open(tuntap_dev *device, struct tuntap_config* config) {
                    device->dev_name, inet_ntoa(a), device->ip_prefixlen);
     }
 
+    /* Increase txqueuelen to reduce TAP write congestion on slow drivers
+     * (e.g. MIPS routers).  Default 500 fills up quickly at ~25 Mbps, causing
+     * non-blocking write() to return EAGAIN and stalling the main loop. */
+    {
+        char _path[256];
+        int _n = snprintf(_path, sizeof(_path),
+                          "/sys/class/net/%s/tx_queue_len", device->dev_name);
+        if (_n > 0 && (size_t)_n < sizeof(_path)) {
+            int _sfd = open(_path, O_WRONLY);
+            if (_sfd >= 0) {
+                if (write(_sfd, "10000", 5) == 5)
+                    traceEvent(TRACE_INFO, "Interface %s txqueuelen set to 10000",
+                               device->dev_name);
+                close(_sfd);
+            }
+        }
+    }
+
     return(device->fd);
 }
 
