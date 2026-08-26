@@ -142,7 +142,6 @@ typedef struct ether_hdr ether_hdr_t;
 #endif /* #ifdef _WIN32 */
 
 #include "n2n_wire.h"
-#include "ikcp.h"
 
 typedef struct route {
     int family;
@@ -518,11 +517,6 @@ struct n2n_edge
     uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
     n2n_sock_t          last_p2p_log_addr;
     uint8_t             last_psp_log_mac[N2N_MAC_SIZE];
-
-    /* TCP KCP transport for reliable tunnel-mode TCP forwarding */
-    ikcpcb              *tcp_kcp;
-    uint8_t              tcp_kcp_buf[2048];
-    uint64_t             tcp_kcp_start;
 
     /* Bypass module */
     bypass_context_t   *bp;
