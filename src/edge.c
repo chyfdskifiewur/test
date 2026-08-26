@@ -6051,9 +6051,13 @@ static int run_loop(n2n_edge_t * eee )
 
         /* If a TAP write is pending (non-blocking EAGAIN), monitor the
          * TAP fd for writability to retry without polling. */
+#ifndef _WIN32
         int tap_pending = (eee->tap_pending_len > 0);
         if (tap_pending)
             FD_SET(eee->device.fd, &bypass_write_mask);
+#else
+        int tap_pending = 0;
+#endif
 
         /* ---------- Wait / wake-up.
          *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
