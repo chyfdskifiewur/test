@@ -382,6 +382,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->bp_proxy_port = 0; /* will use default */
     eee->bp = NULL;
     eee->bp_user_disabled = 1; /* default: bypass off */
+    eee->tap_pending_len = 0;
 
     if(lzo_init() != LZO_E_OK)
     {
@@ -3081,12 +3082,24 @@ static int handle_PACKET( n2n_edge_t * eee,
             }
 
             data_sent_len = tuntap_write(&(eee->device), eth_payload, eth_size);
-            traceEvent(TRACE_DEBUG, "handle_PACKET: tuntap_write done, len=%d", (signed int)data_sent_len);
 
             if (data_sent_len == eth_size)
             {
                 retval = 0;
             }
+#ifndef _WIN32
+            else if (data_sent_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                     eth_size <= (int)sizeof(eee->tap_pending_buf))
+            {
+                /* Non-blocking TAP write failed (driver congested).  Save the
+                 * frame and retry on the next main-loop tick when select()
+                 * reports the TAP fd as writable.  This avoids dropping the
+                 * packet and forcing TCP retransmission / cwnd collapse. */
+                eee->tap_pending_len = (int)eth_size;
+                memcpy(eee->tap_pending_buf, eth_payload, eth_size);
+                retval = 0;
+            }
+#endif
         }
         else
         {
@@ -6014,9 +6027,9 @@ static int run_loop(n2n_edge_t * eee )
 
         /* Add bypass proxy and connection sockets to select */
         fd_set bypass_write_mask;
+        FD_ZERO(&bypass_write_mask);
         int bypass_active = bypass_has_peers(eee->bp);
         if (bypass_active) {
-            FD_ZERO(&bypass_write_mask);
             if (eee->bp->proxy_sock >= 0) {
                 FD_SET(eee->bp->proxy_sock, &socket_mask);
                 max_sock = max(max_sock, eee->bp->proxy_sock);
@@ -6035,6 +6048,12 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
         }
+
+        /* If a TAP write is pending (non-blocking EAGAIN), monitor the
+         * TAP fd for writability to retry without polling. */
+        int tap_pending = (eee->tap_pending_len > 0);
+        if (tap_pending)
+            FD_SET(eee->device.fd, &bypass_write_mask);
 
         /* ---------- Wait / wake-up.
          *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
@@ -6154,7 +6173,7 @@ static int run_loop(n2n_edge_t * eee )
             zt.tv_sec  = 0;
             zt.tv_usec = 0;
             rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
+                        (bypass_active || tap_pending) ? &bypass_write_mask : NULL, NULL, &zt);
         }
 #else
         {
@@ -6162,7 +6181,7 @@ static int run_loop(n2n_edge_t * eee )
             tick.tv_sec  = 0;
             tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;  /* 10 ms */
             rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &tick);
+                        (bypass_active || tap_pending) ? &bypass_write_mask : NULL, NULL, &tick);
         }
 #endif
         nowTime=n2n_now();
@@ -6260,6 +6279,18 @@ static int run_loop(n2n_edge_t * eee )
                 /* Read an ethernet frame from the TAP socket. Write on the IP
                  * socket. */
                 readFromTAPSocket(eee);
+            }
+
+            /* Retry pending TAP write when the TAP driver has room */
+            if (eee->tap_pending_len > 0 &&
+                FD_ISSET(eee->device.fd, &bypass_write_mask))
+            {
+                ssize_t ret = tuntap_write(&eee->device, eee->tap_pending_buf,
+                                           (size_t)eee->tap_pending_len);
+                if (ret == (ssize_t)eee->tap_pending_len ||
+                    (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                    eee->tap_pending_len = 0; /* success or permanent error, discard */
+                /* else: still EAGAIN, leave for next tick — select() will wake again */
             }
 #endif
         }
