@@ -739,11 +739,6 @@ static void edge_deinit(n2n_edge_t * eee)
     clear_peer_list( &(eee->pending_peers) );
     clear_peer_list( &(eee->known_peers) );
 
-    if (eee->tcp_kcp) {
-        ikcp_release(eee->tcp_kcp);
-        eee->tcp_kcp = NULL;
-    }
-
     (eee->transop[N2N_TRANSOP_TF_IDX].deinit)(&eee->transop[N2N_TRANSOP_TF_IDX]);
     (eee->transop[N2N_TRANSOP_NULL_IDX].deinit)(&eee->transop[N2N_TRANSOP_NULL_IDX]);
     (eee->transop[N2N_TRANSOP_AESCBC_IDX].deinit)(&eee->transop[N2N_TRANSOP_AESCBC_IDX]);
@@ -837,27 +832,21 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
 
-    /* If the send buffer is transiently full, retry briefly.  On Windows
-     *   the UDP socket is non-blocking and a busy outbound burst can push
-     *   sendto() to WSAEWOULDBLOCK/WSAENOBUFS.  Dropping those packets
-     *   makes TCP see loss and collapse cwnd, which is especially harmful
-     *   for the forward (TAP->UDP) direction.  A short retry gives the
-     *   kernel time to drain the SO_SNDBUF backlog. */
-    for( int retry = 0; retry < 10 && sent < 0; retry++ )
+    /* Single-thread design: a retry loop would block the main thread,
+     * preventing UDP ACK processing and destroying throughput.
+     * If the send buffer is full, drop the packet — TCP retransmits.
+     * The 128-loop in the main loop processes ACKs quickly so TCP
+     * can recover from any loss. */
+#ifndef _WIN32
+    for( int retry = 0; retry < 50 && sent < 0; retry++ )
     {
-#ifdef _WIN32
-        int error = WSAGetLastError();
-        if( error != WSAEWOULDBLOCK && error != WSAENOBUFS )
-            break;
-        Sleep(1); /* 1 ms — non-blocking wait for send buffer to drain */
-#else
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
         usleep(1000);
-#endif
         sent = sendto( fd, buf, len, 0/*flags*/,
                        (struct sockaddr*) &peer_addr, addr_len );
     }
+#endif
 
     if ( sent < 0 )
     {
@@ -934,95 +923,6 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
     }
 
     return sent;
-}
-
-/* Forward declarations for functions used by KCP transport below */
-static size_t edge_choose_tx_transop( const n2n_edge_t * eee );
-static int send_PACKET( n2n_edge_t * eee,
-                        n2n_mac_t dstMac,
-                        const uint8_t * pktbuf,
-                        size_t pktlen );
-
-/* ===== KCP TCP transport for reliable tunnel-mode TCP forwarding ===== */
-
-/** Monotonic millisecond clock for KCP timing. */
-static uint64_t tcp_kcp_monotonic_ms(void)
-{
-#ifdef _WIN32
-    return (uint64_t)GetTickCount64();
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-#endif
-}
-
-/** KCP output callback: called when KCP needs to send a segment via UDP.
- *  The segment is wrapped in a dummy ethernet frame with ethertype 0x4B43
- *  ("KC"), encrypted, and sent as a regular MSG_TYPE_PACKET.  The supernode
- *  forwards it (no special message type needed), and the receiver detects
- *  the KCP marker by checking the ethertype of the decrypted payload. */
-static int tcp_kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
-{
-    n2n_edge_t *eee = (n2n_edge_t *)user;
-    n2n_common_t cmn;
-    n2n_PACKET_t pkt;
-    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-    uint8_t eth_frame[N2N_PKT_BUF_SIZE];
-    size_t idx = 0, eidx = 0;
-    size_t tx_transop_idx = edge_choose_tx_transop(eee);
-
-    if (tx_transop_idx >= N2N_MAX_TRANSFORMS || !eee->transop[tx_transop_idx].fwd)
-        return len; /* pretend success, KCP will retry */
-
-    /* Wrap KCP segment in an ethernet frame with marker ethertype 0x4B43 */
-    memset(eth_frame + eidx, 0xFF, 6); eidx += 6; /* dst MAC (broadcast) */
-    memcpy(eth_frame + eidx, eee->device.mac_addr, 6); eidx += 6; /* src MAC */
-    eth_frame[eidx++] = 0x4B; eth_frame[eidx++] = 0x43; /* ethertype = "KC" */
-    memcpy(eth_frame + eidx, buf, (size_t)len); eidx += (size_t)len;
-
-    /* Build a regular MSG_TYPE_PACKET (supernode forwards it like any other) */
-    memset(&cmn, 0, sizeof(cmn));
-    cmn.ttl = N2N_DEFAULT_TTL;
-    cmn.pc = MSG_TYPE_PACKET;
-    cmn.flags = 0;
-    memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
-
-    memset(&pkt, 0, sizeof(pkt));
-    memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
-    memcpy(pkt.dstMac, eth_frame, N2N_MAC_SIZE); /* dst MAC = broadcast */
-    pkt.sock.family = 0;
-    pkt.transform = eee->transop[tx_transop_idx].transform_id;
-
-    encode_PACKET(pktbuf, &idx, &cmn, &pkt);
-    idx += eee->transop[tx_transop_idx].fwd(&(eee->transop[tx_transop_idx]),
-                                             pktbuf + idx, N2N_PKT_BUF_SIZE - idx,
-                                             eth_frame, eidx, eth_frame);
-    ++(eee->transop[tx_transop_idx].tx_cnt);
-
-    send_PACKET(eee, eth_frame, pktbuf, idx);
-
-    return len;
-}
-
-/** Drain received KCP data and write to TAP. Should be called periodically
- *  from the main loop after ikcp_input(). Returns number of frames written. */
-static int tcp_kcp_drain(n2n_edge_t *eee)
-{
-    int n = 0;
-    if (!eee->tcp_kcp)
-        return 0;
-    while (n < 64) {
-        int peek = ikcp_peeksize(eee->tcp_kcp);
-        if (peek <= 0) break;
-        uint8_t *buf = eee->tcp_kcp_buf;
-        int ret = ikcp_recv(eee->tcp_kcp, (char *)buf, (int)sizeof(eee->tcp_kcp_buf));
-        if (ret <= 0) break;
-        ssize_t wlen = tuntap_write(&eee->device, buf, (size_t)ret);
-        if (wlen != ret) break;
-        ++n;
-    }
-    return n;
 }
 
 /** Select the correct UDP socket based on destination address family */
@@ -3175,25 +3075,6 @@ static int handle_PACKET( n2n_edge_t * eee,
                         n2n_sock_t dest = *orig_sender;
                         sendto_sock(sock_for_dest(eee, &dest), pktbuf, idx, &dest);
                     }
-                    retval = 0;
-                    return retval;
-                }
-            }
-
-            /* Check for KCP data marker ethertype 0x4B43 ("KC").
-             * KCP segments are wrapped in a dummy ethernet frame by
-             * tcp_kcp_output and sent as MSG_TYPE_PACKET.  The supernode
-             * forwards them like any other packet, and we detect them
-             * here by the ethertype instead of using a separate message
-             * type (which the supernode would drop). */
-            if (eee->tcp_kcp && eth_size >= 14)
-            {
-                uint16_t kcp_etype = (eth_payload[12] << 8) | eth_payload[13];
-                if (kcp_etype == 0x4B43)
-                {
-                    ikcp_input(eee->tcp_kcp, (const char *)(eth_payload + 14),
-                               (long)(eth_size - 14));
-                    tcp_kcp_drain(eee);
                     retval = 0;
                     return retval;
                 }
@@ -5987,28 +5868,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         }
     }
 
-    /* Initialize KCP for reliable TCP transport in tunnel mode */
-    {
-        eee.tcp_kcp = ikcp_create(0x4B435050, &eee);
-        if (eee.tcp_kcp) {
-            ikcp_setoutput(eee.tcp_kcp, tcp_kcp_output);
-            ikcp_nodelay(eee.tcp_kcp, 1, 10, 2, 1);
-            ikcp_wndsize(eee.tcp_kcp, 256, 256);
-            ikcp_setmtu(eee.tcp_kcp, 1500);
-#ifdef _WIN32
-            eee.tcp_kcp_start = (uint64_t)GetTickCount64();
-#else
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            eee.tcp_kcp_start = (uint64_t)_ts.tv_sec * 1000 +
-                                 (uint64_t)_ts.tv_nsec / 1000000;
-#endif
-            traceEvent(TRACE_NORMAL, "KCP TCP transport initialized, conv=0x%08x", 0x4B435050);
-        } else {
-            traceEvent(TRACE_WARNING, "KCP init failed, TCP tunnel transport disabled");
-        }
-    }
-
     traceEvent(TRACE_NORMAL, "Edge started");
 
     setup_upnp(&eee, local_port);
@@ -6274,42 +6133,15 @@ static int run_loop(n2n_edge_t * eee )
                 if (len > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, len);
                 }
-                /* Drain synchronously-completed frames, but after each
-                 *   frame check for incoming UDP data.  This prevents ACK
-                 *   starvation: during a large TCP upload the TAP driver
-                 *   can return many frames synchronously; if we drain them
-                 *   all in one go we delay processing TCP ACKs, which
-                 *   inflates the sender's RTT estimate and suppresses
-                 *   single-stream cwnd growth.  Interleaving one UDP
-                 *   check per TAP frame keeps ACK latency bounded to
-                 *   roughly one frame's encrypt+sendto time (~50µs). */
                 ssize_t slen;
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                    /* Quick non-blocking check for incoming UDP data */
-                    struct timeval _zt = { 0, 0 };
-                    fd_set _rd;
-                    FD_ZERO(&_rd);
-                    if (eee->udp_sock >= 0) {
-                        FD_SET(eee->udp_sock, &_rd);
-                        if (select(eee->udp_sock + 1, &_rd, NULL, NULL, &_zt) > 0)
-                            readFromIPSocket(eee, eee->udp_sock);
-                    }
                 }
             } else if (!eee->device.read_pending) {
-                /* No IRP in flight (lost one, or first tick). Resubmit.
-                 *   Same interleaving as above. */
+                /* No IRP in flight (lost one, or first tick). Resubmit. */
                 ssize_t slen;
                 while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                    struct timeval _zt = { 0, 0 };
-                    fd_set _rd;
-                    FD_ZERO(&_rd);
-                    if (eee->udp_sock >= 0) {
-                        FD_SET(eee->udp_sock, &_rd);
-                        if (select(eee->udp_sock + 1, &_rd, NULL, NULL, &_zt) > 0)
-                            readFromIPSocket(eee, eee->udp_sock);
-                    }
                 }
             }
             /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
@@ -6433,12 +6265,6 @@ static int run_loop(n2n_edge_t * eee )
         }
 
         /* Finished processing select data. */
-
-        /* Drive KCP state machine: retransmission, congestion control, etc.
-         * Must be called every tick (10ms) to advance KCP's internal timer. */
-        if (eee->tcp_kcp) {
-            ikcp_update(eee->tcp_kcp, tcp_kcp_monotonic_ms());
-        }
 
         update_supernode_reg(eee, nowTime);
         PEERS_LOCK(eee);
