@@ -836,21 +836,15 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
      *   the UDP socket is non-blocking and a busy outbound burst can push
      *   sendto() to WSAEWOULDBLOCK/WSAENOBUFS.  Dropping those packets
      *   makes TCP see loss and collapse cwnd, which is especially harmful
-     *   for the forward (TAP->UDP) direction.  A short write-ready poll
-     *   keeps the stall bounded while giving the kernel time to drain the
-     *   SO_SNDBUF backlog. */
+     *   for the forward (TAP->UDP) direction.  A short retry gives the
+     *   kernel time to drain the SO_SNDBUF backlog. */
     for( int retry = 0; retry < 10 && sent < 0; retry++ )
     {
 #ifdef _WIN32
         int error = WSAGetLastError();
         if( error != WSAEWOULDBLOCK && error != WSAENOBUFS )
             break;
-        struct timeval tv = { 0, 1000 }; /* 1 ms */
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        if( select(0, NULL, &wfds, NULL, &tv) <= 0 )
-            break;
+        Sleep(1); /* 1 ms — non-blocking wait for send buffer to drain */
 #else
         if( errno != EAGAIN && errno != EWOULDBLOCK )
             break;
