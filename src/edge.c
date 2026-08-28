@@ -369,7 +369,6 @@ static int edge_init(n2n_edge_t * eee)
     eee->register_lifetime = 120;
     eee->last_p2p = 0;
     eee->last_sup = 0;
-    eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
     eee->sn_af = AF_UNSPEC;
     memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
     memset(&eee->last_resolved_supernode, 0, sizeof(n2n_sock_t));
@@ -379,6 +378,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->peer_sync_ips_count = 0;
     eee->enable_gaming_mode = 0;
     eee->gaming_started = 0;
+    eee->sn_switched  = 0;
+    eee->last_sup_backup = 0;
     eee->bp_proxy_port = 0; /* will use default */
     eee->bp = NULL;
     eee->bp_user_disabled = 1; /* default: bypass off */
@@ -783,7 +784,8 @@ static void help() {
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
     printf("-l <supernode host:port> | Supernode address Formats:\n");
     printf("                         : host:port - direct address, common format (e.g. 1.2.3.4:5678)\n");
-    printf("                         : host      - dns txt address (e.g. n2n6.ouno.eu.org, it's default).\n");
+    printf("                         : host      - dns txt address (e.g. n2n6.ouno.eu.org, it's default)\n");
+    printf("                         : max 2 supernodes (-l xxx again), first is primary, failover auto.\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto).\n");
     printf("-b <port>                | Enable bypass (no port = default port %d).\n", BYPASS_DEFAULT_PORT);
 #if N2N_CAN_NAME_IFACE && !defined(_WIN32)
@@ -932,13 +934,17 @@ SOCKET sock_for_dest( const n2n_edge_t * eee, const n2n_sock_t * dest )
     return eee->udp_sock;
 }
 
-/* WS mode: use ws_send, otherwise UDP. Send failure drops only this packet. */
+/* WS mode: use ws_send, otherwise UDP. Send failure drops only this packet.
+ * Send to the currently active supernode (primary or backup). */
 static ssize_t edge_send_to_sn( n2n_edge_t * eee,
                                 const uint8_t * pktbuf, size_t idx )
 {
     if (eee->use_ws && eee->ws_conn.state == WS_OPEN) {
         return ws_send(&eee->ws_conn, pktbuf, idx);
     }
+
+    /* For single SN (sn_num == 1), always send to the only one.
+     * For two SNs (sn_num == 2), send to the currently active SN (sn_idx). */
     return sendto_sock(sock_for_dest(eee, &eee->supernode), pktbuf, idx, &eee->supernode);
 }
 
@@ -1320,6 +1326,13 @@ static void send_register_super( n2n_edge_t * eee,
         eee->gaming_started = 1;
     }
 
+    /* Just switched to a new supernode: ask for full peer list immediately
+     * so we can reach peers that were registered on the old SN. */
+    if (eee->sn_switched) {
+        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
+        eee->sn_switched = 0;
+    }
+
     idx=0;
     encode_REGISTER_SUPER( pktbuf, &idx, &cmn, &reg );
 
@@ -1337,6 +1350,23 @@ static void send_register_super( n2n_edge_t * eee,
             traceEvent(TRACE_INFO, "send REGISTER_SUPER (alt) to %s",
                        sock_to_cstr(sockbuf, &eee->supernode_alt));
             sendto_sock(alt_sock, pktbuf, idx, &eee->supernode_alt);
+        }
+    }
+
+    /* If two supernodes configured (primary + backup), also register to the
+     * other SN. This keeps the backup SN's registration fresh so we can
+     * failover immediately without waiting for a 30s REGISTER cycle. */
+    if (eee->sn_num == 2) {
+        size_t other_idx = (eee->sn_idx == 0) ? 1 : 0;
+        n2n_sock_t other_sn;
+        int alt_af = (eee->sn_af == AF_UNSPEC) ? AF_UNSPEC : eee->sn_af;
+        if (supernode2addr(&other_sn, alt_af, eee->sn_ip_array[other_idx]) == 0) {
+            traceEvent(TRACE_INFO, "send REGISTER_SUPER to other supernode %s",
+                       sock_to_cstr(sockbuf, &other_sn));
+            SOCKET alt_sock = (other_sn.family == AF_INET6) ? eee->udp_sock6 : eee->udp_sock;
+            if (alt_sock != -1) {
+                sendto_sock(alt_sock, pktbuf, idx, &other_sn);
+            }
         }
     }
 }
@@ -2293,97 +2323,154 @@ static void update_peer_address(n2n_edge_t * eee,
     scan->last_seen = when;
 }
 
+/* ------------------------------------------------------------------ */
+/* Primary / backup supernode handling (only active with 2 SNs).      */
+/*                                                                    */
+/* Registration: REGISTER_SUPER is always sent to BOTH supernodes     */
+/* (see send_register_super). Normal cycle 30 s; while waiting for    */
+/* an ACK it is retried every SN_RETRY_INTERVAL seconds.              */
+/* Failover: current SN has not ACKed for more than                   */
+/*           SN_FAILOVER_TIMEOUT seconds -> switch to the other one.  */
+/* Failback: immediate, on receiving REGISTER_SUPER_ACK from the      */
+/*           primary SN while running on the backup (ACK handling).   */
+#define SN_FAILOVER_TIMEOUT 35
+#define SN_RETRY_INTERVAL    5
+
+/** Switch the active supernode to index idx (0 = primary, 1 = backup).
+ *  Re-resolves its address so registration and relay traffic actually
+ *  follow the switch, and grants a fresh observation window before
+ *  this supernode is evaluated again. */
+static void switch_to_supernode( n2n_edge_t * eee, size_t idx,
+                                 const char * reason, time_t nowTime )
+{
+    traceEvent( TRACE_WARNING, "%s - switching to supernode %u/%u",
+                reason, (unsigned int)(idx + 1), (unsigned int)eee->sn_num );
+
+    eee->sn_idx      = idx;
+    eee->sn_switched = 1; /* ask for full peer list push on next REGISTER */
+    eee->sn_wait     = 0;
+
+    supernode2addr( &(eee->supernode), eee->sn_af, eee->sn_ip_array[idx] );
+
+    /* Refresh alternate-family address for dual-stack registration */
+    {
+        int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[idx]);
+    }
+
+    /* Fresh observation window: give the new SN a full period before
+     * judging it, prevents oscillation between two silent SNs. */
+    if (idx == 0)
+        eee->last_sup = nowTime;
+    else
+        eee->last_sup_backup = nowTime;
+
+    eee->last_register_req = 0; /* register immediately after switching */
+
+    traceEvent( TRACE_NORMAL, "[OK] edge <<< ======= %s ======= >>> supernode - %u/%u",
+                eee->supernode.family == AF_INET6 ? "IPv6" : "IPv4",
+                (unsigned int)(idx + 1), (unsigned int)eee->sn_num );
+}
+
 /** @brief Check to see if we should re-register with the supernode.
  *
  *  This is frequently called by the main loop.
  */
 static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 {
-    if ( nowTime > (time_t) (eee->last_register_req + 30) )
+    /* --- failover: current SN silent for too long -> use the other one --- */
+    if ( eee->sn_num == 2 )
     {
-        eee->sn_wait = 0;
-        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
+        time_t last_ack = ( eee->sn_idx == 0 ) ? eee->last_sup : eee->last_sup_backup;
+        /* No ACK ever received: judge from process start (handles startup
+         * with an unavailable primary SN). */
+        time_t ack_ref  = ( last_ack > 0 ) ? last_ack : eee->start_time;
+
+        if ( ack_ref > 0 && nowTime > (time_t)(ack_ref + SN_FAILOVER_TIMEOUT) )
+        {
+            const char *reason = ( eee->sn_idx == 0 ) ?
+                "Primary supernode not responding" : "Backup supernode not responding";
+
+            switch_to_supernode( eee, 1 - eee->sn_idx, reason, nowTime );
+
+            /* A UDP socket stays valid until explicitly closed; an
+             * unreachable SN means the remote peer is gone, not that our
+             * local socket is broken. Re-opening changes the local port,
+             * invalidating NAT mappings and killing every P2P direct path.
+             * So test the socket with a zero-length sendto and only reopen
+             * on hard errors. */
+            {
+                int sock_broken = 0;
+                if (eee->udp_sock != -1 && eee->supernode.family == AF_INET)
+                {
+                    struct sockaddr_in test_addr;
+                    memset(&test_addr, 0, sizeof(test_addr));
+                    test_addr.sin_family = AF_INET;
+                    test_addr.sin_port = htons(eee->supernode.port);
+                    memcpy(&test_addr.sin_addr, &eee->supernode.addr.v4, IPV4_SIZE);
+                    char dummy = 0;
+                    if (sendto(eee->udp_sock, &dummy, 0, 0,
+                               (const struct sockaddr *)&test_addr,
+                               sizeof(struct sockaddr_in)) < 0)
+                    {
+#ifdef _WIN32
+                        int err = WSAGetLastError();
+                        if (err == WSAEBADF || err == WSAEADDRNOTAVAIL || err == WSAENETDOWN)
+                            sock_broken = 1;
+#else
+                        if (errno == EBADF || errno == EADDRNOTAVAIL || errno == ENETDOWN)
+                            sock_broken = 1;
+#endif
+                    }
+                }
+                if (!sock_broken && eee->udp_sock6 != -1 && eee->supernode.family == AF_INET6)
+                {
+                    struct sockaddr_in6 test_addr;
+                    memset(&test_addr, 0, sizeof(test_addr));
+                    test_addr.sin6_family = AF_INET6;
+                    test_addr.sin6_port = htons(eee->supernode.port);
+                    memcpy(&test_addr.sin6_addr, &eee->supernode.addr.v6, IPV6_SIZE);
+                    char dummy = 0;
+                    if (sendto(eee->udp_sock6, &dummy, 0, 0,
+                               (const struct sockaddr *)&test_addr,
+                               sizeof(struct sockaddr_in6)) < 0)
+                    {
+#ifdef _WIN32
+                        int err = WSAGetLastError();
+                        if (err == WSAEBADF || err == WSAEADDRNOTAVAIL || err == WSAENETDOWN)
+                            sock_broken = 1;
+#else
+                        if (errno == EBADF || errno == EADDRNOTAVAIL || errno == ENETDOWN)
+                            sock_broken = 1;
+#endif
+                    }
+                }
+                if (sock_broken)
+                {
+                    if (eee->udp_sock != -1) closesocket(eee->udp_sock);
+                    if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
+                    eee->udp_sock  = open_socket(eee->local_port, 1);
+                    eee->udp_sock6 = open_socket6(eee->local_port, 1);
+                    traceEvent(TRACE_NORMAL, "UDP socket broken, re-opened");
+                }
+            }
+            return;
+        }
+    }
+
+    /* --- periodic registration ------------------------------------------- */
+    /* last_register_req == 0 means "send right away" (startup, or right
+     * after a switch). While waiting for an ACK, resend every
+     * SN_RETRY_INTERVAL seconds, otherwise keep the normal 30 s cycle. */
+    if ( eee->last_register_req == 0 ||
+         nowTime > (time_t)(eee->last_register_req +
+                            (eee->sn_wait ? SN_RETRY_INTERVAL : 30)) )
+    {
         send_register_super( eee, &(eee->supernode) );
         eee->sn_wait = 1;
         eee->last_register_req = nowTime;
-        return;
     }
-
-    if ( eee->sn_wait && ( nowTime > (time_t) (eee->last_register_req + (eee->register_lifetime/10) ) ) )
-    {
-        /* fall through - fast retry */
-    }
-    else if ( nowTime < (time_t) (eee->last_register_req + eee->register_lifetime))
-    {
-        return; /* Too early */
-    }
-
-    if ( 0 == eee->sup_attempts )
-    {
-        if ( eee->sn_num > 1 )
-        {
-            ++(eee->sn_idx);
-            if (eee->sn_idx >= eee->sn_num) eee->sn_idx=0;
-            traceEvent(TRACE_WARNING, "Supernode not responding - moving to %u of %u",
-                       (unsigned int)eee->sn_idx, (unsigned int)eee->sn_num);
-        } else {
-            /* Single supernode: no point "switching", just retry */
-            traceEvent(TRACE_DEBUG, "Supernode not responding - retrying same supernode");
-        }
-        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-
-        /* Only re-open the UDP sockets when the supernode is unreachable AND
-         * the local connection is completely dead (no P2P direct traffic and
-         * no supernode traffic for a while). Re-opening changes the local UDP
-         * port, which invalidates the NAT mapping of healthy P2P direct paths
-         * — a busy supernode (e.g. evening peak) missing registration ACKs is
-         * NOT a reason to disturb working direct links. But if everything is
-         * truly dead, a fresh socket may clear a stale local state and help
-         * reconnect to the supernode. */
-        {
-            int local_alive = 0;
-            if (eee->last_p2p > 0 && (nowTime - eee->last_p2p) < 30)
-                local_alive = 1;   /* recent direct traffic: local net is fine */
-            else if (eee->last_sup > 0 && (nowTime - eee->last_sup) < 30)
-                local_alive = 1;   /* recent supernode reply: local net is fine */
-
-            if ( !local_alive && ( eee->local_port == 0 || eee->local_port > 1024 ) )
-            {
-                if (eee->udp_sock != -1) closesocket(eee->udp_sock);
-                if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
-                eee->udp_sock  = open_socket(eee->local_port, 1);
-                eee->udp_sock6 = open_socket6(eee->local_port, 1);
-                traceEvent(TRACE_NORMAL, "Supernode unreachable and no local traffic: re-opened UDP sockets");
-            }
-        }
-
-        /* Re-resolve supernode address when switching to a different supernode */
-        if(eee->re_resolve_supernode_ip)
-        {
-            supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
-            
-            /* Re-resolve alternate address for dual-stack registration */
-            {
-                int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-                int can_resolve = (alt_af == AF_INET6) ? (eee->udp_sock6 != -1) : (eee->udp_sock != -1);
-                memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
-                if (can_resolve) {
-                    supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]);
-                }
-            }
-        }
-    }
-    else
-    {
-        --(eee->sup_attempts);
-    }
-
-    /* Note: Domain re-resolution during normal registration is handled by
-     * check_supernode_domain_and_update() which runs every 300 seconds when idle. */
-
-    send_register_super( eee, &(eee->supernode) );
-    eee->sn_wait=1;
-    eee->last_register_req = nowTime;
 }
 
 /* @return 1 if destination is a peer, 0 if destination is supernode */
@@ -2563,24 +2650,14 @@ static int send_PACKET( n2n_edge_t * eee,
         sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
         if (probing) {
             /* Probe window: also relay via supernode so no data is lost
-             * while the direct path is being verified. */
-            if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
-                if (++eee->sn_relay_fails >= 3)
-                    eee->last_register_req = 0;
-            } else {
-                eee->sn_relay_fails = 0;
-            }
+             * while the direct path is being verified. SN reachability is
+             * handled centrally by update_supernode_reg (time based). */
+            edge_send_to_sn(eee, pktbuf, pktlen);
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
         /* Relay via supernode: WS mode uses ws_send, otherwise UDP */
-        if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
-            /* Consecutive failures trigger supernode re-registration */
-            if (++eee->sn_relay_fails >= 3)
-                eee->last_register_req = 0;
-        } else {
-            eee->sn_relay_fails = 0;
-        }
+        edge_send_to_sn(eee, pktbuf, pktlen);
     }
 
     /* If routing via supernode for a unicast peer, re-register with supernode
@@ -4349,21 +4426,39 @@ process_n2n_packet:
 
                 if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
                 {
-                    eee->sn_ack_count++;
+                    /* For two SN configuration: check which SN this ACK came from.
+                     * Primary SN index 0 → update last_sup; backup index 1 → update last_sup_backup.
+                     * Only primary ACK increments sn_ack_count, so backup ACK does not
+                     * interfere with the full processing (IP assignment, peer list, etc.). */
+                    int is_primary_ack = 1;
+                    if (eee->sn_num == 2) {
+                        if (eee->sn_idx == 0) {
+                            is_primary_ack = (sock_equal(&sender, &eee->supernode) == 0);
+                        } else {
+                            is_primary_ack = (sock_equal(&sender, &eee->supernode) != 0);
+                        }
+                    }
 
-                    if ( ra.num_sn > 0 )
-                    {
-                        traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER_ACK backup supernode at %s",
-                                   sock_to_cstr(sockbuf1, &(ra.sn_bak) ) );
+                    if (is_primary_ack) {
+                        /* Primary ACK: count it and refresh primary freshness */
+                        eee->sn_ack_count++;
+
+                        if (eee->sn_idx != 0) {
+                            /* We were on backup, primary is back — switch immediately */
+                            switch_to_supernode( eee, 0, "Primary supernode back online", now );
+                        } else {
+                            eee->last_sup = now;
+                        }
+                    } else {
+                        /* Backup ACK: just keep freshness, do not count as primary ACK */
+                        eee->last_sup_backup = now;
+                        traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER_ACK from backup supernode");
                     }
 
                     /* Only do full processing on the first ACK; subsequent ACKs
                      * (from alt address family) just refresh last_sup silently. */
-                    if ( eee->sn_ack_count == 1 ) {
-                        eee->last_sup = now;
+                    if ( eee->sn_ack_count == 1 && is_primary_ack ) {
                         eee->sn_wait = 0;
-                        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-                        eee->sn_relay_fails = 0;
 
                         if (default_ip_assignment && ra.dev_addr.net_addr != 0) {
                             struct in_addr addr;
@@ -5041,7 +5136,6 @@ static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
         traceEvent(TRACE_NORMAL, "Re-registering with supernode at new address");
         
         /* Reset supernode connection state */
-        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         eee->sn_wait = 0;
         
         send_register_super(eee, &(eee->supernode));
@@ -5699,7 +5793,17 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     while (supernode2addr(&(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx]) != 0) {
         if (!g_edge_running) break;
-        traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
+
+        if (eee.sn_num > 1) {
+            /* Try the next configured supernode first before sleeping */
+            traceEvent(TRACE_WARNING, "Failed to resolve supernode %s, trying next (%u of %u)...",
+                       eee.sn_ip_array[eee.sn_idx],
+                       (unsigned int)(eee.sn_idx + 1), (unsigned int)eee.sn_num);
+            eee.sn_idx = (eee.sn_idx + 1) % eee.sn_num;
+        } else {
+            traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
+        }
+
 #ifdef _WIN32
         Sleep(5000);
 #else
