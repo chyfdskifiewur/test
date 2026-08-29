@@ -391,7 +391,8 @@ extern char *n2n_sw_version, *n2n_sw_version_full, *n2n_sw_osName, *n2n_sw_build
 #define N2N_EDGE_SN_HOST_SIZE   48
 typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 
-#define N2N_EDGE_NUM_SUPERNODES 2  /* Primary + backup: always one primary, one backup */
+#define N2N_EDGE_NUM_SUPERNODES 2
+#define N2N_EDGE_SUP_ATTEMPTS   3
 
 #ifndef N2N_PATHNAME_MAXLEN
 #define N2N_PATHNAME_MAXLEN     256
@@ -411,6 +412,7 @@ struct n2n_edge
 
     n2n_sock_t          supernode;
     n2n_sock_t          supernode_alt;
+    n2n_sock_t          sn_backup;      /* other supernode (dual-SN), used for probe/failback */
 
     size_t              sn_idx;
     size_t              sn_num;
@@ -460,13 +462,14 @@ struct n2n_edge
     CRITICAL_SECTION    peers_lock;
 #endif
     time_t              last_register_req;
+    time_t              last_primary_probe; /* last heartbeat sent to primary (on backup) */
     size_t              register_lifetime;
     time_t              last_p2p;
-    time_t              last_sup;           /* last time we got ACK from current SN */
-    time_t              last_sup_backup;    /* last time we got ACK from backup SN (sn_idx 1) */
+    time_t              last_sup;
+    size_t              sup_attempts;
+    uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;
-    uint8_t             sn_switched;        /* 1 if just switched to a new SN, forces FORCE_PEER_INFO on next REGISTER_SUPER */
     uint8_t             sn_ipv4_support;
     uint8_t             sn_ipv6_support;
 

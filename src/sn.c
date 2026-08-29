@@ -462,8 +462,9 @@ static void save_community_stats(n2n_sn_t *sss, time_t now)
                 s->min_idx, (int64_t)s->last_minute);
         for (int i = 0; i < COMM_STATS_DAYS; i++)
             fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
-        /* 24h 分钟桶：每行 240 个值，共 6 行。
-         * 必须持久化，否则重启后滑动窗口无法衰减，24h 限速会永久命中。 */
+        /* 24h minute buckets: 6 rows x 240 values each.
+         * Must be persisted, otherwise the sliding window cannot decay
+         * across restarts and the 24h rate limit would hit permanently. */
         for (int i = 0, c = 0; i < COMM_STATS_MINUTES; i++) {
             fprintf(fp, "%" PRIu64 "%c", s->bytes_1440[i], c == 239 ? '\n' : ' ');
             if (++c == 240) c = 0;
@@ -520,7 +521,7 @@ static void load_community_stats(n2n_sn_t *sss)
             p++;
         }
 
-        /* 24h 分钟桶：每行 240 个值，共 6 行 */
+        /* 24h minute buckets: 6 rows x 240 values each */
         int got = 0;
         char mline[6144];
         while (got < COMM_STATS_MINUTES) {
@@ -3014,7 +3015,20 @@ static int run_loop( n2n_sn_t * sss )
                 }
             }
 
-            /* WebSocket: process data from connected edges */
+            /* WebSocket: process data from connected edges.
+             *
+             * KNOWN LIMITATION (fairness under many concurrent WS conns):
+             * ws_send uses a BLOCKING send bounded by 3s (SO_SNDTIMEO, see
+             * ws_send_all in ws.c). If one WS peer stops reading (its TCP
+             * window stays 0), forwarding to it can block this
+             * single-threaded main loop for up to 3s, briefly stalling the
+             * other 63 WS connections. This is acceptable for the common
+             * 1-edge-per-SN deployment (a stalled peer is purged after 60s
+             * by sn_ws_purge), but if a future deployment runs dozens of WS
+             * edges with poor downlinks, revisit: switch to a truly
+             * non-blocking send (per-conn TX queue + select writable event
+             * drive, no blocking send at all) so one slow peer cannot delay
+             * the others. */
             {
                 int wi;
                 for (wi = 0; wi < N2N_SN_MAX_WS; wi++) {
@@ -3022,7 +3036,13 @@ static int run_loop( n2n_sn_t * sss )
                     if (wc->state != WS_OPEN || wc->fd < 0) continue;
                     if (!FD_ISSET(wc->fd, &socket_mask)) continue;
 
-                    {
+                    /* Drain the WS connection like the UDP path does
+                     * (128-frame cap): ws_recv decodes ONE complete n2n
+                     * frame per call, so without a loop every select tick
+                     * (~10 ms) forwards just one frame per connection —
+                     * capping WS relay throughput at ~1 Mbps regardless of
+                     * link speed. */
+                    for (int _wi = 0; _wi < 128; _wi++) {
                         uint8_t wbuf[N2N_SN_PKTBUF_SIZE];
                         ssize_t n = ws_recv(wc, wbuf, sizeof(wbuf));
                         if (n > 0) {
@@ -3034,8 +3054,11 @@ static int run_loop( n2n_sn_t * sss )
                         } else if (n < 0) {
                             traceEvent(TRACE_DEBUG, "WS conn[%d] closed by peer", wi);
                             sn_ws_drop_conn(sss, wi);
+                            break;
+                        } else {
+                            /* n == 0: no complete frame yet, wait for next select */
+                            break;
                         }
-                        /* n == 0: no complete frame yet, wait for next select */
                     }
                 }
             }
