@@ -4914,171 +4914,64 @@ static int query_dns_record(const char *domain, char *ip_result, size_t result_s
 
 /* ***************************************************** */
 
-/** HTTP 302 redirect resolver (pure socket, no curl/wget).
- *
- *  Sends HTTP GET to the given URL, follows 302 redirect,
- *  extracts host:port from the Location header.
- *
- *  @param url  the HTTP redirect URL (http://host[:port][/path])
- *  @param result  buffer to write the resolved host:port
- *  @param result_size  size of result buffer
- *  @return 0 on success, -1 on failure
- */
+/** HTTP 302 redirect via pure socket (no curl/wget). */
 static int query_http_redirect(const char *url, char *result, size_t result_size) {
-    char host[N2N_EDGE_SN_HOST_SIZE];
-    char path[256];
-    int port = 80;
-    const char *p;
-    size_t len;
+    char host[256], path[256] = "/", buf[4096], *p;
+    const char *q;
+    int port = 80, total = 0, n;
+    SOCKET sock;
+    struct addrinfo hints, *ai;
 
-    if (!url || !result || result_size < 2)
-        return -1;
+    if (!url || !result || result_size < 2) return -1;
+    if (strncmp(url, "http://", 7)) return -1;
 
-    /* Parse URL: http://host[:port][/path] */
-    if (strncmp(url, "http://", 7) != 0)
-        return -1;
-    p = url + 7;
+    /* Parse http://host[:port][/path] */
+    for (p = (char *)(url + 7), q = p; *q && *q != ':' && *q != '/'; q++);
+    if (q - p <= 0 || q - p >= (int)sizeof(host)) return -1;
+    memcpy(host, p, q - p); host[q - p] = '\0';
+    p = (char *)q;
+    if (*p == ':') { port = 0; while (*++p >= '0' && *p <= '9') port = port * 10 + (*p - '0'); if (port < 1 || port > 65535) return -1; }
+    if (*p == '/') { size_t sl = strlen(p); if (sl >= sizeof(path)) return -1; memcpy(path, p, sl + 1); }
 
-    /* Extract host part */
-    len = 0;
-    while (p[len] && p[len] != ':' && p[len] != '/')
-        len++;
-    if (len == 0 || len >= sizeof(host))
-        return -1;
-    memcpy(host, p, len);
-    host[len] = '\0';
-    p += len;
-
-    /* Extract port */
-    if (*p == ':') {
-        p++;
-        port = 0;
-        while (*p >= '0' && *p <= '9')
-            port = port * 10 + (*p++ - '0');
-        if (port < 1 || port > 65535)
-            return -1;
-    }
-
-    /* Extract path */
-    if (*p == '/') {
-        size_t slen = strlen(p);
-        if (slen >= sizeof(path))
-            return -1;
-        strncpy(path, p, sizeof(path) - 1);
-        path[sizeof(path) - 1] = '\0';
-    } else {
-        strcpy(path, "/");
-    }
-
-    /* Create TCP socket */
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
-        return -1;
-
-    /* Set receive timeout */
+    /* TCP connect */
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
 #ifdef _WIN32
-    DWORD tv = 5000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+    { DWORD tv = 5000; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)); }
 #else
-    struct timeval tv = {5, 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    { struct timeval tv = {5, 0}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 #endif
+    snprintf(buf, sizeof(buf), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, buf, &hints, &ai) != 0 || !ai) { closesocket(sock); return -1; }
+    n = connect(sock, ai->ai_addr, ai->ai_addrlen); freeaddrinfo(ai);
+    if (n < 0) { closesocket(sock); return -1; }
 
-    /* Resolve hostname and connect */
-    {
-        struct addrinfo hints, *ai = NULL;
-        char port_str[8];
+    /* HTTP GET */
+    n = snprintf(buf, sizeof(buf), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+    if (n < 0 || send(sock, buf, n, 0) < 0) { closesocket(sock); return -1; }
 
-        snprintf(port_str, sizeof(port_str), "%d", port);
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
+    /* Receive response */
+    while ((n = recv(sock, buf + total, sizeof(buf) - 1 - total, 0)) > 0) { total += n; if (total >= (int)sizeof(buf) - 1) break; }
+    closesocket(sock);
+    if (total <= 0) return -1;
+    buf[total] = '\0';
 
-        if (getaddrinfo(host, port_str, &hints, &ai) != 0 || !ai) {
-            closesocket(sock);
-            return -1;
-        }
+    /* Find Location: header */
+    if (!(p = strstr(buf, "\nLocation:")) && !(p = strstr(buf, "\nlocation:"))) return -1;
+    p += 10;
+    while (*p == ' ' || *p == '\t') p++;
+    for (q = p; *q && *q != '\r' && *q != '\n'; q++);
+    if (q - p <= 0 || q - p >= (int)result_size) return -1;
+    memcpy(result, p, q - p); result[q - p] = '\0';
 
-        if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0) {
-            freeaddrinfo(ai);
-            closesocket(sock);
-            return -1;
-        }
-        freeaddrinfo(ai);
-    }
+    /* Strip scheme prefix */
+    if (strncmp(result, "http://", 7) == 0) memmove(result, result + 7, strlen(result) - 6);
+    else if (strncmp(result, "https://", 8) == 0) { traceEvent(TRACE_ERROR, "Redirect target is HTTPS, not supported"); return -1; }
 
-    /* Send HTTP GET request */
-    {
-        char request[512];
-        int slen = snprintf(request, sizeof(request),
-                            "GET %s HTTP/1.1\r\n"
-                            "Host: %s\r\n"
-                            "Connection: close\r\n"
-                            "\r\n", path, host);
-        if (slen < 0 || send(sock, request, slen, 0) < 0) {
-            closesocket(sock);
-            return -1;
-        }
-    }
-
-    /* Receive response headers */
-    {
-        char response[4096];
-        int total = 0, n;
-
-        while ((n = (int)recv(sock, response + total,
-                              sizeof(response) - 1 - total, 0)) > 0) {
-            total += n;
-            if (total >= (int)sizeof(response) - 1)
-                break;
-        }
-        closesocket(sock);
-
-        if (total <= 0)
-            return -1;
-        response[total] = '\0';
-
-        /* Find Location header (case-insensitive) */
-        const char *loc;
-        if ((loc = strstr(response, "\nLocation:")) || (loc = strstr(response, "\nlocation:")))
-            loc++; /* skip the leading \n */
-        else if ((loc = strstr(response, "\r\nLocation:")) || (loc = strstr(response, "\r\nlocation:")))
-            loc += 2; /* skip the leading \r\n */
-        else
-            return -1;
-
-        /* Skip past "Location:" or "location:" */
-        loc += 9;
-        while (*loc == ' ' || *loc == '\t')
-            loc++;
-
-        /* Extract location value (up to CR/LF) */
-        char location[512];
-        len = 0;
-        while (loc[len] && loc[len] != '\r' && loc[len] != '\n' && len < sizeof(location) - 1)
-            len++;
-        memcpy(location, loc, len);
-        location[len] = '\0';
-
-        /* Parse host:port from location URL */
-        p = location;
-        if (strncmp(p, "http://", 7) == 0) {
-            p += 7;
-        } else if (strncmp(p, "https://", 8) == 0) {
-            traceEvent(TRACE_ERROR, "Redirect target is HTTPS, not supported by HTTP redirect resolver");
-            return -1;
-        }
-
-        /* Extract host:port (up to '/' or end) */
-        len = 0;
-        while (p[len] && p[len] != '/' && len < result_size - 1)
-            len++;
-        if (len == 0)
-            return -1;
-        memcpy(result, p, len);
-        result[len] = '\0';
-    }
-
+    /* Strip trailing path */
+    for (p = result; *p; p++) if (*p == '/') { *(char *)p = '\0'; break; }
     return 0;
 }
 
@@ -5317,78 +5210,45 @@ static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
 
 /* ***************************************************** */
 
-/** Periodically check HTTP redirect for updated supernode address.
- *
- *  Re-queries the HTTP redirect URL every 300 seconds when idle.
- *  If the redirect target changes, updates the supernode address
- *  and re-registers.
- *
- *  @return 1 if address changed and re-registered, 0 otherwise
- */
+/** Periodically check HTTP redirect for updated supernode address. */
 static int check_http_redirect_and_update(n2n_edge_t *eee, time_t now) {
     n2n_sock_t new_addr;
     char resolved[N2N_EDGE_SN_HOST_SIZE];
 
-    /* Skip if no HTTP redirect URL configured */
-    if (eee->http_redirect_url[0] == '\0')
-        return 0;
-
-    /* Check every 300 seconds (5 minutes) */
-    if (eee->last_http_check != 0 && (now - eee->last_http_check) < 300)
-        return 0;
-
-    /* Only resolve if edge is idle */
-    if ((now - eee->last_p2p <= 30))
-        return 0;
-    if ((now - eee->last_sup <= 30))
-        return 0;
+    if (eee->http_redirect_url[0] == '\0') return 0;
+    if (eee->last_http_check != 0 && now - eee->last_http_check < 300) return 0;
+    if (now - eee->last_p2p <= 30 || now - eee->last_sup <= 30) return 0;
 
     eee->last_http_check = now;
 
-    /* Query HTTP redirect */
     if (query_http_redirect(eee->http_redirect_url, resolved, sizeof(resolved)) != 0) {
         traceEvent(TRACE_DEBUG, "HTTP redirect query failed, will retry later");
         return 0;
     }
 
-    /* Resolve the redirected address into a socket */
     memset(&new_addr, 0, sizeof(n2n_sock_t));
     if (supernode2addr(&new_addr, eee->sn_af, resolved) != 0) {
         traceEvent(TRACE_WARNING, "Failed to resolve redirected address %s", resolved);
         return 0;
     }
 
-    /* Check if address changed */
-    if (eee->last_http_supernode.family != 0 &&
-        sock_equal(&eee->last_http_supernode, &new_addr) != 0) {
+    if (eee->last_http_supernode.family != 0 && sock_equal(&eee->last_http_supernode, &new_addr) != 0) {
         n2n_sock_str_t new_str;
         sock_to_cstr(new_str, &new_addr);
         traceEvent(TRACE_NORMAL, "HTTP redirect: supernode address changed to %s", new_str);
-
         eee->supernode = new_addr;
         eee->last_http_supernode = new_addr;
-
-        /* Re-resolve alternate address for dual-stack registration */
-        {
-            int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-            int can_resolve = (alt_af == AF_INET6) ? (eee->udp_sock6 != -1) : (eee->udp_sock != -1);
-            memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
-            if (can_resolve)
-                supernode2addr(&eee->supernode_alt, alt_af, resolved);
-        }
-
-        traceEvent(TRACE_NORMAL, "Re-registering with supernode at new address");
-
+        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        if (eee->supernode.family == AF_INET6 ? eee->udp_sock6 != -1 : eee->udp_sock != -1)
+            supernode2addr(&eee->supernode_alt, eee->supernode.family == AF_INET6 ? AF_INET : AF_INET6, resolved);
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         eee->sn_wait = 0;
         send_register_super(eee, &eee->supernode);
         eee->last_register_req = now;
         return 1;
     } else if (eee->last_http_supernode.family == 0) {
-        /* First resolution - just store it */
         eee->last_http_supernode = new_addr;
     }
-
     return 0;
 }
 
