@@ -4912,6 +4912,7 @@ static int query_dns_record(const char *domain, char *ip_result, size_t result_s
 /* ***************************************************** */
 /* HTTP redirect resolver - raw socket, no external deps  */
 /* ***************************************************** */
+static int resolve_redirect_https(const char *url, char *result, size_t result_size);
 static int resolve_redirect_http(const char *url, char *result, size_t result_size) {
     char host[256], path[1024];
     int port = 80;
