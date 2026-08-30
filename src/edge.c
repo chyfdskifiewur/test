@@ -4910,9 +4910,9 @@ static int query_dns_record(const char *domain, char *ip_result, size_t result_s
 }
 
 /* ***************************************************** */
-/* HTTP redirect resolver - raw socket, no external deps  */
+/* HTTP redirect resolver - pure C socket, no external deps */
+/* Only supports http:// (not https://)                     */
 /* ***************************************************** */
-static int resolve_redirect_https(const char *url, char *result, size_t result_size);
 static int resolve_redirect_http(const char *url, char *result, size_t result_size) {
     char host[256], path[1024];
     int port = 80;
@@ -4930,13 +4930,14 @@ static int resolve_redirect_http(const char *url, char *result, size_t result_si
         if (hl >= sizeof(host)) hl = sizeof(host) - 1;
         memcpy(host, p, hl); host[hl] = '\0';
         strncpy(path, slash, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
     } else {
         strncpy(host, p, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
         strncpy(path, "/", sizeof(path) - 1);
     }
-    path[sizeof(path) - 1] = '\0';
 
-    /* Extract port */
+    /* Extract port from host */
     char *colon = strchr(host, ':');
     if (colon) {
         *colon = '\0';
@@ -4999,23 +5000,23 @@ static int resolve_redirect_http(const char *url, char *result, size_t result_si
     char *loc = strstr(buf, "\r\nLocation: ");
     if (!loc) loc = strstr(buf, "\r\nlocation: ");
     if (!loc) {
-        /* Also check at start of response (first header line) */
         loc = strstr(buf, "Location: ");
         if (!loc) loc = strstr(buf, "location: ");
     }
     if (!loc) return -1;
 
-    loc = strstr(loc, ": ") + 2; /* skip "Location: " or "location: " */
+    loc = strstr(loc, ": ") + 2; /* skip "Location: " */
     char *end = strstr(loc, "\r\n");
     if (end) *end = '\0';
 
-    /* Strip [following] suffix (from older curl output) */
+    /* Strip [following] suffix */
     char *f = strstr(loc, " [following]");
     if (f) *f = '\0';
 
-    /* If redirect target is HTTPS, fall back to curl/wget resolver */
+    /* HTTPS redirect target not supported without external tools */
     if (strncmp(loc, "https://", 8) == 0) {
-        return resolve_redirect_https(loc, result, result_size);
+        traceEvent(TRACE_WARNING, "HTTPS redirect target requires curl or wget (not available)");
+        return -1;
     }
 
     /* Extract host:port from URL */
@@ -5028,122 +5029,14 @@ static int resolve_redirect_http(const char *url, char *result, size_t result_si
         strncpy(result, loc, result_size - 1);
     }
     result[result_size - 1] = '\0';
-    return 0;
-}
 
-/* ***************************************************** */
-/* HTTPS redirect resolver - uses curl/wget               */
-/* ***************************************************** */
-static int resolve_redirect_https(const char *url, char *result, size_t result_size) {
-    char cmd[512];
-    FILE *fp;
-    char line[1024];
-    char last_location[1024] = {0};
-
-    /* Try curl first (available on Ubuntu and Windows) */
-#ifdef _WIN32
-    snprintf(cmd, sizeof(cmd),
-             "curl -s -L -k -m 5 -i \"%s\" 2>nul", url);
-    fp = _popen(cmd, "r");
-#else
-    snprintf(cmd, sizeof(cmd),
-             "curl -s -L -k -m 5 -i \"%s\" 2>/dev/null", url);
-    fp = popen(cmd, "r");
-#endif
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strncmp(line, "Location:", 9) == 0 || strncmp(line, "location:", 9) == 0) {
-                strncpy(last_location, line + 9, sizeof(last_location) - 1);
-                last_location[sizeof(last_location) - 1] = '\0';
-            }
-        }
-#ifdef _WIN32
-        _pclose(fp);
-#else
-        pclose(fp);
-#endif
-        if (last_location[0] != '\0') goto parse_location;
-    }
-
-#ifndef _WIN32
-    /* curl failed or not available, try wget */
-    char last_connecting[1024] = {0};
-    snprintf(cmd, sizeof(cmd),
-             "wget -O /dev/null -T 5 \"%s\" 2>&1", url);
-    fp = popen(cmd, "r");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strncmp(line, "Location:", 9) == 0 || strncmp(line, "location:", 9) == 0) {
-                strncpy(last_location, line + 9, sizeof(last_location) - 1);
-                last_location[sizeof(last_location) - 1] = '\0';
-            } else if (strstr(line, "Connecting to ") != NULL) {
-                /* Fallback: capture last "Connecting to host:port" line */
-                strncpy(last_connecting, line, sizeof(last_connecting) - 1);
-                last_connecting[sizeof(last_connecting) - 1] = '\0';
-            }
-        }
-        pclose(fp);
-        if (last_location[0] != '\0') goto parse_location;
-        /* No Location header found, try to extract host:port from Connecting to line */
-        if (last_connecting[0] != '\0') {
-            char *p = strstr(last_connecting, "Connecting to ");
-            if (p) {
-                p += 14; /* skip "Connecting to " */
-                /* Format: "host:port (IP:port)" or "host (IP:port)" */
-                char *space = strchr(p, ' ');
-                if (space) *space = '\0';
-                /* If format is "host:port", extract directly */
-                if (strchr(p, ':') != NULL) {
-                    strncpy(result, p, result_size - 1);
-                    result[result_size - 1] = '\0';
-                    traceEvent(TRACE_INFO, "Redirect resolved to %s", result);
-                    return 0;
-                }
-            }
-        }
-    }
-#endif
-
-    return -1;
-
-parse_location:
-    {
-        /* Strip leading spaces and trailing newline */
-        char *p = last_location;
-        while (*p == ' ') p++;
-        p[strcspn(p, "\r\n")] = '\0';
-
-        /* Strip [following] suffix */
-        char *f = strstr(p, " [following]");
-        if (f) *f = '\0';
-
-        /* Extract host:port from URL */
-        if (strstr(p, "://") != NULL) {
-            char *hp = strstr(p, "://") + 3;
-            char *sl = strchr(hp, '/');
-            if (sl) *sl = '\0';
-            strncpy(result, hp, result_size - 1);
-        } else {
-            strncpy(result, p, result_size - 1);
-        }
-        result[result_size - 1] = '\0';
-        return 0;
-    }
-}
-
-/* ***************************************************** */
-/* Resolve HTTP/HTTPS redirect URL to supernode host:port */
-/* ***************************************************** */
-static int resolve_redirect(const char *url, char *result, size_t result_size) {
-    if (!url || !result || result_size == 0)
+    /* Validate result contains host:port */
+    if (strchr(result, ':') == NULL) {
+        traceEvent(TRACE_WARNING, "Redirect target has no port: %s", result);
         return -1;
-
-    if (strncmp(url, "http://", 7) == 0) {
-        return resolve_redirect_http(url, result, result_size);
-    } else if (strncmp(url, "https://", 8) == 0) {
-        return resolve_redirect_https(url, result, result_size);
     }
-    return -1;
+
+    return 0;
 }
 
 /* ***************************************************** */
@@ -5863,12 +5756,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
                 strncpy( (eee.sn_ip_array[eee.sn_num]), optarg, N2N_EDGE_SN_HOST_SIZE);
                 traceEvent(TRACE_DEBUG, "Adding supernode[%u] = %s", (unsigned int)eee.sn_num, (eee.sn_ip_array[eee.sn_num]) );
                 ++eee.sn_num;
-                /* Resolve HTTP/HTTPS redirect URL to actual supernode address */
+                /* Resolve HTTP redirect URL to actual supernode address */
                 int sn_idx = eee.sn_num - 1;
-                if (strncmp(eee.sn_ip_array[sn_idx], "http://", 7) == 0 ||
-                    strncmp(eee.sn_ip_array[sn_idx], "https://", 8) == 0) {
+                if (strncmp(eee.sn_ip_array[sn_idx], "http://", 7) == 0) {
                     n2n_sn_name_t resolved;
-                    if (resolve_redirect(eee.sn_ip_array[sn_idx], resolved, sizeof(resolved)) == 0) {
+                    if (resolve_redirect_http(eee.sn_ip_array[sn_idx], resolved, sizeof(resolved)) == 0) {
                         traceEvent(TRACE_NORMAL, "Supernode %d: %s -> %s",
                                    sn_idx + 1, eee.sn_ip_array[sn_idx], resolved);
                         strncpy(eee.sn_ip_array[sn_idx], resolved, N2N_EDGE_SN_HOST_SIZE - 1);
@@ -5877,6 +5769,9 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
                         fprintf(stderr, "Failed to resolve HTTP redirect for %s\n", optarg);
                         exit(1);
                     }
+                } else if (strncmp(eee.sn_ip_array[sn_idx], "https://", 8) == 0) {
+                    fprintf(stderr, "HTTPS redirect not supported (use http:// or a direct supernode address)\n");
+                    exit(1);
                 }
             } else {
                 fprintf(stderr, "Too many supernodes!\n" );
