@@ -5062,10 +5062,12 @@ static int query_http_redirect(const char *url, char *result, size_t result_size
 
         /* Parse host:port from location URL */
         p = location;
-        if (strncmp(p, "http://", 7) == 0)
+        if (strncmp(p, "http://", 7) == 0) {
             p += 7;
-        else if (strncmp(p, "https://", 8) == 0)
-            p += 8;
+        } else if (strncmp(p, "https://", 8) == 0) {
+            traceEvent(TRACE_ERROR, "Redirect target is HTTPS, not supported by HTTP redirect resolver");
+            return -1;
+        }
 
         /* Extract host:port (up to '/' or end) */
         len = 0;
@@ -6022,7 +6024,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         exit(1);
     }
 
-    printf("\n");
     traceEvent(TRACE_NORMAL, "Starting edge %s", n2n_sw_version_full);
 
     for (int i = 0; i < eee.sn_num; ++i) {
@@ -6036,12 +6037,15 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         if (query_http_redirect(eee.sn_ip_array[eee.sn_idx], resolved_addr, sizeof(resolved_addr)) == 0) {
             strncpy(eee.http_redirect_url, eee.sn_ip_array[eee.sn_idx], sizeof(eee.http_redirect_url) - 1);
             eee.http_redirect_url[sizeof(eee.http_redirect_url) - 1] = '\0';
-            traceEvent(TRACE_NORMAL, "HTTP redirect resolved: %s -> %s", eee.http_redirect_url, resolved_addr);
+            traceEvent(TRACE_NORMAL, "HTTP redirect resolved to %s", resolved_addr);
             strncpy(eee.sn_ip_array[eee.sn_idx], resolved_addr, N2N_EDGE_SN_HOST_SIZE - 1);
             eee.sn_ip_array[eee.sn_idx][N2N_EDGE_SN_HOST_SIZE - 1] = '\0';
         } else {
             traceEvent(TRACE_WARNING, "Failed to resolve HTTP redirect for %s", eee.sn_ip_array[eee.sn_idx]);
         }
+    } else if (strncmp(eee.sn_ip_array[eee.sn_idx], "https://", 8) == 0) {
+        traceEvent(TRACE_ERROR, "HTTPS redirect not supported, use http:// instead");
+        return -1;
     }
 
     while (supernode2addr(&(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx]) != 0) {
