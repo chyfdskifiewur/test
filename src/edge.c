@@ -5012,6 +5012,11 @@ static int resolve_redirect_http(const char *url, char *result, size_t result_si
     char *f = strstr(loc, " [following]");
     if (f) *f = '\0';
 
+    /* If redirect target is HTTPS, fall back to curl/wget resolver */
+    if (strncmp(loc, "https://", 8) == 0) {
+        return resolve_redirect_https(loc, result, result_size);
+    }
+
     /* Extract host:port from URL */
     if (strstr(loc, "://") != NULL) {
         char *hp = strstr(loc, "://") + 3;
