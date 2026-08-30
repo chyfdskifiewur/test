@@ -5067,6 +5067,7 @@ static int resolve_redirect_https(const char *url, char *result, size_t result_s
 
 #ifndef _WIN32
     /* curl failed or not available, try wget */
+    char last_connecting[1024] = {0};
     snprintf(cmd, sizeof(cmd),
              "wget -O /dev/null -T 5 \"%s\" 2>&1", url);
     fp = popen(cmd, "r");
@@ -5075,10 +5076,31 @@ static int resolve_redirect_https(const char *url, char *result, size_t result_s
             if (strncmp(line, "Location:", 9) == 0 || strncmp(line, "location:", 9) == 0) {
                 strncpy(last_location, line + 9, sizeof(last_location) - 1);
                 last_location[sizeof(last_location) - 1] = '\0';
+            } else if (strstr(line, "Connecting to ") != NULL) {
+                /* Fallback: capture last "Connecting to host:port" line */
+                strncpy(last_connecting, line, sizeof(last_connecting) - 1);
+                last_connecting[sizeof(last_connecting) - 1] = '\0';
             }
         }
         pclose(fp);
         if (last_location[0] != '\0') goto parse_location;
+        /* No Location header found, try to extract host:port from Connecting to line */
+        if (last_connecting[0] != '\0') {
+            char *p = strstr(last_connecting, "Connecting to ");
+            if (p) {
+                p += 14; /* skip "Connecting to " */
+                /* Format: "host:port (IP:port)" or "host (IP:port)" */
+                char *space = strchr(p, ' ');
+                if (space) *space = '\0';
+                /* If format is "host:port", extract directly */
+                if (strchr(p, ':') != NULL) {
+                    strncpy(result, p, result_size - 1);
+                    result[result_size - 1] = '\0';
+                    traceEvent(TRACE_INFO, "Redirect resolved to %s", result);
+                    return 0;
+                }
+            }
+        }
     }
 #endif
 
