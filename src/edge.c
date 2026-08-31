@@ -785,8 +785,9 @@ static void help() {
     printf("-c <community>           | N2n community name the edge belongs to.\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
     printf("-l <supernode host:port> | Supernode address Formats:\n");
-    printf("                         : host:port - direct address, common format (e.g. 1.2.3.4:5678)\n");
-    printf("                         : host      - dns txt address (e.g. n2n6.ouno.eu.org, it's default)\n");
+    printf("                         : host:port  - direct address, common format (e.g. 1.2.3.4:5678)\n");
+    printf("                         : host       - dns txt address (e.g. n2n6.ouno.eu.org, it's default)\n");
+    printf("                         : http://... - http 302 redirect (no https://... redirection)\n");
     printf("                         : max 2 supernodes (-l xxx again), first is primary, failover auto.\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto).\n");
     printf("-b <port>                | Enable bypass (no port = default port %d).\n", BYPASS_DEFAULT_PORT);
@@ -4915,12 +4916,52 @@ static int query_dns_record(const char *domain, char *ip_result, size_t result_s
 /* ***************************************************** */
 
 /** HTTP 302 redirect via pure socket (no curl/wget). */
+/* Resolve hostname to IPv4 via raw DNS A-record query to hardcoded servers.
+ *  Returns 0 on success, -1 on failure. */
+static int dns_resolve_a(const char *host, struct in_addr *addr) {
+    const char *dns[] = {"8.8.8.8","119.29.29.29","1.1.1.1","223.5.5.5"};
+    uint8_t b[512];
+    for (int i = 0; i < 4; i++) {
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa)); sa.sin_family = AF_INET; sa.sin_port = htons(53);
+        if (!inet_pton(AF_INET, dns[i], &sa.sin_addr)) continue;
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) continue;
+#ifdef _WIN32
+        { DWORD tv = 5000; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)); }
+#else
+        { struct timeval tv = {5, 0}; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+#endif
+        memset(b, 0, 12); b[0] = 0x12; b[1] = 0x34; b[2] = 0x01; b[5] = 0x01;
+        int n = 12;
+        { const char *p = host; while (*p && n < 250) {
+            const char *dot = strchr(p, '.'); size_t l = dot ? (size_t)(dot - p) : strlen(p);
+            if (l > 63) { closesocket(s); goto next; }
+            b[n++] = (uint8_t)l; memcpy(b + n, p, l); n += (int)l;
+            p = dot ? dot + 1 : p + l; if (!dot) break;
+        } b[n++] = 0; b[n++] = 0; b[n++] = 1; b[n++] = 0; b[n++] = 1; }
+        sendto(s, (char *)b, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+        n = recvfrom(s, (char *)b, sizeof(b), 0, NULL, NULL); closesocket(s);
+        if (n > 12 && b[0] == 0x12 && b[1] == 0x34 && (b[2] & 0x80) && !(b[3] & 0x0F) && ((b[6] << 8) | b[7]) > 0) {
+            size_t pos = 12;
+            while (pos < (size_t)n && b[pos] != 0) { if (b[pos] & 0xC0) { pos += 2; break; } pos += b[pos] + 1; }
+            if (pos < (size_t)n) pos++; pos += 4;
+            if (b[pos] & 0xC0) pos += 2; else { while (pos < (size_t)n && b[pos] != 0) pos += b[pos] + 1; if (pos < (size_t)n) pos++; }
+            if (pos + 14 <= (size_t)n && b[pos] == 0 && b[pos+1] == 1 && b[pos+8] == 0 && b[pos+9] == 4) {
+                memcpy(addr, b + pos + 10, 4); return 0;
+            }
+        }
+        next: ;
+    }
+    return -1;
+}
+
 static int query_http_redirect(const char *url, char *result, size_t result_size) {
     char host[256], path[256] = "/", buf[4096], *p;
     const char *q;
     int port = 80, total = 0, n;
     SOCKET sock;
-    struct addrinfo hints, *ai;
+    struct sockaddr_in sa;
 
     if (!url || !result || result_size < 2) return -1;
     if (strncmp(url, "http://", 7)) return -1;
@@ -4941,11 +4982,23 @@ static int query_http_redirect(const char *url, char *result, size_t result_size
 #else
     { struct timeval tv = {5, 0}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
 #endif
-    snprintf(buf, sizeof(buf), "%d", port);
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, buf, &hints, &ai) != 0 || !ai) { closesocket(sock); return -1; }
-    n = connect(sock, ai->ai_addr, ai->ai_addrlen); freeaddrinfo(ai);
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    {
+        struct addrinfo hints, *ai;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        snprintf(buf, sizeof(buf), "%d", port);
+        if (getaddrinfo(host, buf, &hints, &ai) == 0 && ai) {
+            memcpy(&sa, ai->ai_addr, sizeof(sa));
+            freeaddrinfo(ai);
+        } else {
+            /* Fallback: raw DNS query */
+            if (dns_resolve_a(host, &sa.sin_addr) != 0) { closesocket(sock); return -1; }
+        }
+    }
+    n = connect(sock, (struct sockaddr *)&sa, sizeof(sa));
     if (n < 0) { closesocket(sock); return -1; }
 
     /* HTTP GET */
@@ -5004,6 +5057,14 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
                 /* No port: query TXT record for supernode address */
                 query_txt_record(addr, addr, N2N_EDGE_SN_HOST_SIZE);
                 len = strlen(addr);
+                /* TXT record may contain an HTTP redirect URL */
+                if (len > 7 && strncmp(addr, "http://", 7) == 0) {
+                    if (query_http_redirect(addr, addr, N2N_EDGE_SN_HOST_SIZE) != 0) {
+                        traceEvent(TRACE_WARNING, "Failed to resolve HTTP redirect from TXT: %s", addr);
+                        return -1;
+                    }
+                    len = strlen(addr);
+                }
                 supernode_port = strrchr(addr, ':');
                 if (supernode_port) {
                     sn->port = atoi(supernode_port + 1);
