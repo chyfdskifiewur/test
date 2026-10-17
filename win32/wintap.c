@@ -648,9 +648,12 @@ int tuntap_restart( tuntap_dev* device ) {
         0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0
     );
     if(device->device_handle == INVALID_HANDLE_VALUE) {
-        W32_ERROR(GetLastError(), error)
-        traceEvent(TRACE_ERROR, "Unable to reopen TAP adapter %ls: %ls", device->device_name, error);
-        W32_ERROR_FREE(error)
+        DWORD err = GetLastError();
+        /* Print the numeric code: FormatMessage returns localized (non-ASCII) text
+         *   that the narrow vsnprintf used by traceEvent cannot convert, which
+         *   would wipe the whole message and leave only the level prefix. */
+        traceEvent(TRACE_ERROR, "Unable to reopen TAP adapter %ls (winerr=%lu)",
+                   device->device_name, (unsigned long) err);
         return -1;
     }
 
@@ -661,9 +664,8 @@ int tuntap_restart( tuntap_dev* device ) {
     }
 
     if (rc != 0) {
-        W32_ERROR(rc, error)
-        traceEvent(TRACE_WARNING, "Unable to set device %ls IP address: %u", device->device_name, error);
-        W32_ERROR_FREE(error)
+        traceEvent(TRACE_WARNING, "Unable to set device %ls IP address (winerr=%lu)",
+                   device->device_name, (unsigned long) rc);
 
         return -1;
     }
@@ -672,9 +674,8 @@ int tuntap_restart( tuntap_dev* device ) {
         rc = set_static_routes(device);
 
         if (rc != 0) {
-            W32_ERROR(rc, error)
-            traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %u", device->device_name, error);
-            W32_ERROR_FREE(error)
+            traceEvent(TRACE_WARNING, "Unable to set device %ls static route (winerr=%lu)",
+                       device->device_name, (unsigned long) rc);
 
             return -1;
         }
@@ -692,9 +693,9 @@ int tuntap_restart( tuntap_dev* device ) {
         &status, sizeof (status),
         &status, sizeof (status), &len, NULL
     )) {
-        W32_ERROR(GetLastError(), error);
-        traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls: %ls", device->device_name, error);
-        W32_ERROR_FREE(error);
+        DWORD err = GetLastError();
+        traceEvent(TRACE_ERROR, "Unable to enable TAP adapter %ls (winerr=%lu)",
+                   device->device_name, (unsigned long) err);
         return -1;
     }
 
