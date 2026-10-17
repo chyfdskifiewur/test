@@ -63,6 +63,7 @@
 #define REGISTER_SUPER_INTERVAL_MIN     10   /* sec */
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
+#define TAP_RESTART_RETRY_INTERVAL      (10) /* sec. Retry gap after a failed TAP reopen. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
@@ -7462,6 +7463,7 @@ static int run_loop(n2n_edge_t * eee )
     time_t lastIfaceCheck=0;
     time_t lastTransop=0;
     time_t lastUpnpRenew=0;
+    time_t lastTapRestart=0;   /* last TAP reopen attempt (Windows data-plane recovery) */
     int   retval = 0;
 
 #ifdef _WIN32
@@ -7687,6 +7689,37 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
             /* else: TAP IRP still pending — leave it */
+
+            /* Data-plane recovery: a pending TAP read is cancelled when Windows
+             *   resets the miniport (host resume from sleep/hibernate, driver
+             *   reload), after which ReadFile keeps failing with
+             *   ERROR_OPERATION_ABORTED / ERROR_INVALID_HANDLE. Previously those
+             *   errors were swallowed and re-submitted every tick, so the TAP RX
+             *   path stayed dead while the supernode side looked perfectly
+             *   healthy ("connected" but unable to ping anyone). tuntap_restart()
+             *   reopens the device and re-applies IP/routes/media status. */
+            /* Skip during shutdown: CancelIo() fires the same abort that marks
+             *   read_fatal, and the device is about to be closed anyway. */
+            if (eee->device.read_fatal && g_edge_running) {
+                time_t tap_now = n2n_now();
+                if (lastTapRestart == 0 ||
+                    (tap_now - lastTapRestart) >= TAP_RESTART_RETRY_INTERVAL)
+                {
+                    lastTapRestart = tap_now;
+                    traceEvent(TRACE_WARNING, "TAP device lost - restarting TAP");
+                    if (tuntap_restart(&eee->device) < 0) {
+                        traceEvent(TRACE_ERROR,
+                                   "TAP restart failed, retrying in %ds",
+                                   TAP_RESTART_RETRY_INTERVAL);
+                    } else {
+                        ssize_t slen;
+                        lastTapRestart = 0; /* clear cooldown for the next event */
+                        while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                            process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                        }
+                    }
+                }
+            }
 
             /* Zero-timeout select services UDP/mgmt/WS/bypass fds without blocking */
             struct timeval zt;
