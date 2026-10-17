@@ -485,7 +485,11 @@ ssize_t tuntap_read_begin_overlapped(struct tuntap_dev *tuntap) {
     case ERROR_OPERATION_ABORTED:
     case ERROR_INVALID_HANDLE:
     case ERROR_HANDLE_EOF:
-        /* Normal during shutdown / idle — silent. */
+        /* Device reset / closed. During shutdown the main loop checks
+         *   keep_running and exits instead of restarting; otherwise this is
+         *   the signal that the TAP handle must be reopened (e.g. after the
+         *   host resumed from sleep/hibernate and Windows reset the miniport). */
+        tuntap->read_fatal = 1;
         return -1;
     default: {
         W32_ERROR(GetLastError(), error);
@@ -517,7 +521,8 @@ ssize_t tuntap_read_complete_overlapped(struct tuntap_dev *tuntap) {
         if (err == ERROR_OPERATION_ABORTED || err == ERROR_INVALID_HANDLE ||
             err == ERROR_HANDLE_EOF)
         {
-            /* Normal during shutdown — silent. */
+            /* Device reset / closed — signal that the handle must be reopened. */
+            tuntap->read_fatal = 1;
             return -1;
         }
         W32_ERROR(err, error);
@@ -634,6 +639,7 @@ int tuntap_restart( tuntap_dev* device ) {
 
     ResetEvent(device->overlap_write.hEvent);
     ResetEvent(device->overlap_read.hEvent);
+    device->read_pending = 0;   /* the pending IRP died with the old handle */
 
     swprintf(tapname, sizeof(tapname), USERMODEDEVICEDIR "%s" TAP_WIN_SUFFIX, device->device_name);
     device->device_handle = CreateFile(
@@ -705,6 +711,10 @@ int tuntap_restart( tuntap_dev* device ) {
         traceEvent(TRACE_ERROR, "Failed to re-create TAP write thread!");
         return -1;
     }
+
+    /* The old read state went away with the old handle; clear the fatal flag so
+     *   the main loop re-arms the reader against the freshly opened device. */
+    device->read_fatal = 0;
 
     return 0;
 }
