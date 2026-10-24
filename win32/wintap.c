@@ -485,10 +485,7 @@ ssize_t tuntap_read_begin_overlapped(struct tuntap_dev *tuntap) {
     case ERROR_OPERATION_ABORTED:
     case ERROR_INVALID_HANDLE:
     case ERROR_HANDLE_EOF:
-        /* Device reset / closed. During shutdown the main loop checks
-         *   keep_running and exits instead of restarting; otherwise this is
-         *   the signal that the TAP handle must be reopened (e.g. after the
-         *   host resumed from sleep/hibernate and Windows reset the miniport). */
+        /* TAP handle is gone (system resume / driver reset); reopen it. */
         tuntap->read_fatal = 1;
         return -1;
     default: {
@@ -648,10 +645,8 @@ int tuntap_restart( tuntap_dev* device ) {
         0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0
     );
     if(device->device_handle == INVALID_HANDLE_VALUE) {
+        /* Numeric code only: localized text breaks traceEvent's narrow vsnprintf. */
         DWORD err = GetLastError();
-        /* Print the numeric code: FormatMessage returns localized (non-ASCII) text
-         *   that the narrow vsnprintf used by traceEvent cannot convert, which
-         *   would wipe the whole message and leave only the level prefix. */
         traceEvent(TRACE_ERROR, "Unable to reopen TAP adapter %ls (winerr=%lu)",
                    device->device_name, (unsigned long) err);
         return -1;
@@ -713,8 +708,7 @@ int tuntap_restart( tuntap_dev* device ) {
         return -1;
     }
 
-    /* The old read state went away with the old handle; clear the fatal flag so
-     *   the main loop re-arms the reader against the freshly opened device. */
+    /* Let the main loop re-arm the reader against the new handle. */
     device->read_fatal = 0;
 
     return 0;
