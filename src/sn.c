@@ -1415,18 +1415,25 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             const char *ver = b->version[0] ? b->version : "-";
             const char *os_name = b->os_name[0] ? b->os_name : "-";
             /* A single-row table cannot be told apart by order alone, so the
-             * little brother carries the "-b" marker (my -b points at it,
-             * i.e. it is the one configured via -b). The big brother
-             * (which configured us as its -b) gets none. */
+             * little brother carries the "-b" marker in the label column, in
+             * place of its row number (my -b points at it, i.e. it is the one
+             * configured via -b). The big brother (which configured us as its
+             * -b) gets none. */
             const char *marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
                                ? "-b" : NULL;
             /* have_v4 || have_v6 holds above, so a stamp is always set. */
             time_t last = b->seen ? b->seen : b->seen6;
 
+            char label[8];
+            if (marker)
+                snprintf(label, sizeof(label), "%s", marker);
+            else
+                snprintf(label, sizeof(label), "%d", counter);
+
             size_t line_start = written;
             written += snprintf(buf + written, bufsz - written,
-                                "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
-                                counter,
+                                "%4s  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
+                                label,
                                 b->mac[0], b->mac[1], b->mac[2],
                                 b->mac[3], b->mac[4], b->mac[5],
                                 v4_part, v6_part);
@@ -1434,13 +1441,8 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             written += snprintf(buf + written, bufsz - written, "%-9.9s", ver);
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_os);
             written += snprintf(buf + written, bufsz - written, "%-7.7s", os_name);
-            /* The little brother's "-b" takes the "nat" column, as it does on
-             * the edge side, and the heartbeat age follows in a fixed-width
-             * slot so it lines up on every row. The slot stays blank on rows
-             * without a marker. */
+            /* The heartbeat age sits in the "nat" column on every row. */
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_age);
-            written += snprintf(buf + written, bufsz - written, "%-7.5s",
-                                marker ? marker : "");
             written += snprintf(buf + written, bufsz - written, "%ld",
                                 (long)(now - last));
             written += snprintf(buf + written, bufsz - written, "\n");

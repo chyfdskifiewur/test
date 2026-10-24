@@ -4458,8 +4458,8 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             if ( sn_is_ack_brother(eee, (int)sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
             /* Fixed column widths -> fixed left edges: marker 2, mac 17, host
-             * 65, version 7, tok 7, -b; version/token land on the header columns. */
-            char ver_field[8];
+             * 65, version 9, tok 7, -b; version/token land on the header columns. */
+            char ver_field[10];
             char tok_row[8];
             /* The ACK-learned brother row carries no real data (never configured via
              * -l, never registered to): dash version/token like the MAC/host. */
@@ -4472,11 +4472,11 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 const char *ver_str = ( sn_i == eee->sn_idx &&
                                         eee->supernode_version[0] != '\0' )
                                     ? eee->supernode_version : "-";
-                snprintf(ver_field, sizeof(ver_field), "%.7s", ver_str);
+                snprintf(ver_field, sizeof(ver_field), "%.9s", ver_str);
                 snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17.17s  %-65.65s  %-7.7s  %-7.7s  %s\n",
+                               " %s  %-17.17s  %-65.65s  %-9.9s  %-7.7s  %s\n",
                                marker, mac_str, sn_host, ver_field,
                                tok_row, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
