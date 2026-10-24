@@ -2700,7 +2700,7 @@ static void nat_classify( n2n_edge_t * eee )
     eee->nat_type = new_type;
 
     /* One combined line: legacy RFC 3489 label first, RFC 5780 behaviour(rank) second. */
-    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489 / 5780): %s / %s",
+    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489/5780): %s/%s",
                 N2N_NAT_LEGACY_NAME( new_type ), N2N_NAT_NAME( new_type ) );
 
     /* Push the fresh NAT type to the SN right away so its relay-eligibility
@@ -4101,7 +4101,19 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  f       Sync peers with supernode\n"
                                 "  n       Re-run NAT type detection\n"
                                 "          (briefly drops the network link, use with care)\n"
-                                "  <enter> Display statistics\n\n");
+                                "  <enter> Display statistics\n"
+                                "\n"
+                                "NAT rank (RFC 5780 behaviour / RFC 3489 label), 1 = easiest to punch:\n"
+                                "  1: EIM+EIF   / full-cone\n"
+                                "  2: EIM+ADF   / addr-restr\n"
+                                "  3: EIM+APDF  / port-restr\n"
+                                "  4: ADM+EIF   / addr-dep-map\n"
+                                "  5: ADM+ADF   / addr-dep-map\n"
+                                "  6: ADM+APDF  / addr-dep-map\n"
+                                "  7: APDM+EIF  / symmetric\n"
+                                "  8: APDM+ADF  / symmetric\n"
+                                "  9: APDM+APDF / symmetric\n"
+                                "(unknown = not measured yet)\n\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -4566,7 +4578,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
            (struct sockaddr*) &sender_sock, i);
 
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "Type \"help\" to see more commands.\n");
+                       "Type \"help\" to see more commands and notes.\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 }
