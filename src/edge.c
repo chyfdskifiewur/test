@@ -4472,7 +4472,15 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 const char *ver_str = ( sn_i == eee->sn_idx &&
                                         eee->supernode_version[0] != '\0' )
                                     ? eee->supernode_version : "-";
-                snprintf(ver_field, sizeof(ver_field), "%.9s", ver_str);
+                size_t vn = 0;
+                while ( ver_str[vn] && vn < sizeof(ver_field) - 1 ) {
+                    if ( ver_str[vn] == '_' && ver_str[vn+1] == 'r' &&
+                         ver_str[vn+2] >= '0' && ver_str[vn+2] <= '9' )
+                        break;
+                    vn++;
+                }
+                memcpy(ver_field, ver_str, vn);
+                ver_field[vn] = '\0';
                 snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
