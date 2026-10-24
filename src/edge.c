@@ -1401,8 +1401,14 @@ static void send_register_super( n2n_edge_t * eee,
             reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
         }
 
-        /* Report our measured RFC 5780 rank so the SN can display it per edge. */
-        reg.aflags |= N2N_NAT_AFLAGS( eee->nat_type );
+        /* Report our measured NAT type so the SN can display it per edge. */
+        switch ( eee->nat_type )
+        {
+        case N2N_NAT_FULL_CONE:     reg.aflags |= N2N_AFLAGS_NAT_FULL_CONE; break;
+        case N2N_NAT_RESTRICTED:    reg.aflags |= N2N_AFLAGS_NAT_RESTRICTED; break;
+        case N2N_NAT_PORT_RESTRICT: reg.aflags |= N2N_AFLAGS_NAT_PORT_RESTRICT; break;
+        case N2N_NAT_SYMMETRIC:     reg.aflags |= N2N_AFLAGS_NAT_SYMMETRIC; break;
+        }
 
         /* Hard-NAT punch-round re-registration (consumed on use): the sn hands
          * off only when both edges set this bit, so plain registrations stay quiet. */
@@ -2546,10 +2552,10 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 }
 
 /* ------------------------------------------------------------------ */
-/* RFC 5780 NAT detection via dual-sn reflection + sn bounce:
- * mapping axis = sn main/alt ports (APDM arbiter) + cross-IP sn2 (EIM vs ADM);
- * filtering axis = brother N2NF stranger (EIF) and helper-port bounce (ADF).
- * The pair is ranked 1..9; a never-contacted source is required for EIF.
+/* NAT type detection via dual-sn reflection + sn bounce: both supernodes echo
+ * the observed source (ACK.sock); identical -> Cone, difference -> Symmetric.
+ * A helper-socket bounce before the ACK proves not port-restricted; full cone
+ * needs a never-contacted source (brother sn's N2NF probe, once per mapping).
  * IPv4-only: IPv6 reflections are ignored so a family flip never looks like a re-map. */
 /* One-shot symmetric check: the stranger window stays open NAT_STRANGER_SECS,
  * then the second-observation probe is spent (at most NAT_SYM_MAX_TRIES). */
@@ -2617,77 +2623,67 @@ static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
 
 static void nat_classify( n2n_edge_t * eee )
 {
-    uint8_t new_type, mapping, filtering;
-    int pub1, pub2, pubc, have_alt, have_cross, mapping_known;
+    const char *old, *new;
+    uint8_t new_type;
+    int pub1, pub2;
 
     if ( eee->nat_final )
         return; /* frozen: the verdict cannot change again in this mapping */
 
     if ( eee->nat_seen_sn1.family != AF_INET &&
-         eee->nat_seen_sn2.family != AF_INET &&
-         eee->nat_seen_sn_cross.family != AF_INET )
+         eee->nat_seen_sn2.family != AF_INET )
         return; /* nothing observed yet */
 
     pub1 = ( eee->nat_seen_sn1.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn1.addr.v4 ) );
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
-    pubc = ( eee->nat_seen_sn_cross.family == AF_INET &&
-             !nat_addr_private( eee->nat_seen_sn_cross.addr.v4 ) );
 
-    have_alt   = ( eee->nat_seen_sn2_alt.family == AF_INET );
-    have_cross = pubc;
-    mapping_known = 0;
-    mapping = N2N_NAT_MAP_EIM;
+    /* Within-IP port reuse is the reliable NAT3/NAT4 arbiter (NAT3 reuses, NAT4 churns). */
+    int reuse2 = ( eee->nat_seen_sn2.family == AF_INET &&
+                   eee->nat_seen_sn2_alt.family == AF_INET &&
+                   eee->nat_seen_sn2.port == eee->nat_seen_sn2_alt.port );
 
-    /* RFC 5780 mapping axis (Test I): does the public port survive a new destination?
-     *   sn main vs sn alt (same IP, other port): equal -> not APDM, differs -> APDM;
-     *   cross-IP sn2 vs sn main: differs -> ADM (the port follows the IP only).
-     * The within-IP twin is the arbiter; the cross-IP probe only splits EIM/ADM. */
-    if ( pub2 && have_alt )
+    /* Port differs toward sn2, a distinct IP: NAT3 changes port per destination by
+     * design, so this never implies NAT4 alone (reuse2 stays arbiter), but it vetoes NAT1. */
+    int cross_diff = ( eee->nat_seen_sn_cross.family == AF_INET &&
+                       eee->nat_seen_sn2.family == AF_INET &&
+                       eee->nat_seen_sn_cross.port != eee->nat_seen_sn2.port );
+
+    if ( pub1 && pub2 && !reuse2 &&
+         ( ( eee->nat_seen_sn2_alt.family == AF_INET &&
+             eee->nat_seen_sn2.port != eee->nat_seen_sn2_alt.port ) ||
+           memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
+           eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
+        /* Twin observations disagree: endpoint-dependent mapping -> symmetric
+         * (outranks the N2NF probe: endpoint-independent filtering with
+         * endpoint-dependent mapping must not read as full cone). */
+        new_type = N2N_NAT_SYMMETRIC;
+    else if ( eee->fc_seen && !cross_diff )
+        /* A stranger probe from the never-contacted brother crossed: filter open -> full cone. */
+        new_type = N2N_NAT_FULL_CONE;
+    else if ( pub1 && pub2 )
     {
-        mapping_known = 1;
-        if ( eee->nat_seen_sn2.port != eee->nat_seen_sn2_alt.port )
-            mapping = N2N_NAT_MAP_APDM;
-        else if ( have_cross && eee->nat_seen_sn_cross.port != eee->nat_seen_sn2.port )
-            mapping = N2N_NAT_MAP_ADM;
+        if ( eee->nat_bounce_seen )
+            new_type = N2N_NAT_RESTRICTED;
         else
-            mapping = N2N_NAT_MAP_EIM;
+            /* Cone confirmed, helper-port bounce never delivered -> port-restricted. */
+            new_type = N2N_NAT_PORT_RESTRICT;
     }
-    else if ( ( pub1 || pub2 ) && have_cross )
+    else if ( eee->nat_bounce_seen )
     {
-        mapping_known = 1;
-        if ( eee->nat_seen_sn_cross.port !=
-             ( pub1 ? eee->nat_seen_sn1.port : eee->nat_seen_sn2.port ) )
-            mapping = N2N_NAT_MAP_ADM;
-    }
-    else if ( pub1 || pub2 )
-    {
-        /* One destination only: no cross-port evidence, assume the common EIM
-         * (the twin probe upgrades this to APDM/ADM as soon as it answers). */
-        mapping_known = 1;
-        mapping = N2N_NAT_MAP_EIM;
-    }
-
-    if ( !mapping_known )
-    {
-        new_type = N2N_NAT_UNKNOWN; /* in-LAN observation proves nothing */
+        /* No comparable second observation, but a public helper bounce proves
+         * the NAT is not port-restricted (full cone reports here too). */
+        new_type = N2N_NAT_RESTRICTED;
     }
     else
-    {
-        /* RFC 5780 filtering axis (Test II/III):
-         * stranger N2NF from the never-contacted brother crossed -> EIF,
-         * helper-port bounce (same IP, other port) crossed     -> ADF,
-         * neither delivered                                    -> APDF. */
-        if ( eee->fc_seen )
-            filtering = N2N_NAT_FILT_EIF;
-        else if ( eee->nat_bounce_seen )
-            filtering = N2N_NAT_FILT_ADF;
-        else
-            filtering = N2N_NAT_FILT_APDF;
+        new_type = N2N_NAT_UNKNOWN; /* in-LAN observation proves nothing */
 
-        new_type = N2N_NAT_RANK( mapping, filtering );
-    }
+    if ( cross_diff && new_type != N2N_NAT_SYMMETRIC )
+        traceEvent( TRACE_DEBUG,
+                    "NAT cross-IP port differs toward sn2: not full cone (kept %s, "
+                    "full cone vetoed if the brother probe had reached us)",
+                    N2N_NAT_NAME( new_type ) );
 
     /* A partial observation set derives UNKNOWN — never let that erase a verdict
      * the edge already holds (a real mapping change reset nat_type itself). */
@@ -2697,11 +2693,11 @@ static void nat_classify( n2n_edge_t * eee )
     if ( new_type == eee->nat_type )
         return;
 
+    old = N2N_NAT_NAME( eee->nat_type );
+    new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    /* One combined line: legacy RFC 3489 label first, RFC 5780 behaviour(rank) second. */
-    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489/5780): %s/%s",
-                N2N_NAT_LEGACY_NAME( new_type ), N2N_NAT_NAME( new_type ) );
+    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
     /* Push the fresh NAT type to the SN right away so its relay-eligibility
      * decision never lags. The SN alone decides who relays (PEER_INFO RELAY). */
@@ -2732,8 +2728,7 @@ static void nat_note_helper_port( n2n_edge_t * eee )
         return;
     }
 
-    if ( eee->nat_type == N2N_NAT_UNKNOWN ||
-         N2N_NAT_FILTERING( eee->nat_type ) != N2N_NAT_FILT_APDF )
+    if ( eee->nat_type != N2N_NAT_PORT_RESTRICT )
         return;
 
     eee->nat_final = 0;
@@ -2783,16 +2778,7 @@ static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
     {
         eee->fc_seen = 1;
         traceEvent( TRACE_INFO, "NAT full-cone probe accepted (never-contacted source)" );
-        /* A stranger delivery upgrades a frozen APDF label to EIF. */
-        if ( eee->nat_final && eee->nat_type != N2N_NAT_UNKNOWN &&
-             N2N_NAT_FILTERING( eee->nat_type ) == N2N_NAT_FILT_APDF )
-        {
-            eee->nat_final = 0;
-            nat_classify( eee );
-            eee->nat_final = 1;
-        }
-        else
-            nat_classify( eee );
+        nat_classify( eee );
     }
 }
 
@@ -2940,11 +2926,11 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         return;
     }
 
-    /* Phase 2.5: one-shot behaviour check (normal mode). Twin probe to the
+    /* Phase 2.5: one-shot symmetric check (normal mode). Twin probe to the
      * supernode's main + alt port (same IP, two destination ports): equal
-     * public ports prove the mapping is port-independent (EIM or ADM), while
-     * disagreeing ports prove APDM. The cross-IP probe to sn2 then splits
-     * EIM from ADM. Frozen until the mapping changes; skipped during failover. */
+     * public ports prove per-IP reuse (NAT3), disagreeing ports prove
+     * endpoint-dependent mapping (NAT4/symmetric). Frozen until the mapping
+     * changes; skipped during failover; waits for Test I. */
     if ( !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->supernode.family != 0 &&
@@ -2971,8 +2957,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             eee->sn_probe_cookie_valid = 1;
 
             /* Twin probe to the current supernode's main + alt port (lport,
-             * lport+1): equal public ports prove the mapping does not depend on
-             * the destination port; this is the APDM arbiter, kept everywhere. */
+             * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
+             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
             if ( eee->supernode.family == AF_INET &&
                  eee->supernode.port != 0xFFFF )
@@ -2982,8 +2968,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 send_register_super( eee, &snq_alt, 0, 2, NULL );
             }
 
-            /* Cross-IP probe to sn2 (distinct public IP): splits EIM from ADM.
-             * The within-IP reuse evidence above stays the APDM arbiter. */
+            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
+             * confirmatory only — cross-IP difference must never upgrade to NAT4
+             * (the within-IP reuse evidence above is the arbiter). */
             int cross_probe = ( eee->sn_num >= 2 &&
                              eee->sn_query.family == AF_INET &&
                              eee->supernode.family == AF_INET &&
@@ -4101,19 +4088,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  f       Sync peers with supernode\n"
                                 "  n       Re-run NAT type detection\n"
                                 "          (briefly drops the network link, use with care)\n"
-                                "  <enter> Display statistics\n"
-                                "\n"
-                                "NAT rank (RFC 5780 behaviour / RFC 3489 label), 1 = easiest to punch:\n"
-                                "  1: EIM+EIF   / full-cone\n"
-                                "  2: EIM+ADF   / addr-restr\n"
-                                "  3: EIM+APDF  / port-restr\n"
-                                "  4: ADM+EIF   / addr-dep-map\n"
-                                "  5: ADM+ADF   / addr-dep-map\n"
-                                "  6: ADM+APDF  / addr-dep-map\n"
-                                "  7: APDM+EIF  / symmetric\n"
-                                "  8: APDM+ADF  / symmetric\n"
-                                "  9: APDM+APDF / symmetric\n"
-                                "(unknown = not measured yet)\n\n");
+                                "  <enter> Display statistics\n\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -4255,9 +4230,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send header */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       " id  mac                n2n_ip           wan_ip                                            ver      os       nat\n");
+                       " id  mac                n2n_ip           wan_ip                                            ver        os       nat\n");
 	msg_len += snprintf((char*) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                        "---v2.3----------------------------------------------------------------------------------------------------------------\n");
+                        "---v2.3------------------------------------------------------------------------------------------------------------------\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -4316,7 +4291,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 }
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %2u  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                id++, macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
                                N2N_NAT_NAME(peer->nat_type));
@@ -4394,7 +4369,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             else
                 snprintf(seq, sizeof(seq), "%2u", id++);
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %s  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                seq,
                                macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
@@ -4427,7 +4402,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             }
             n2n_sock_str_t rsbuf;
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %2u  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                rid++, macaddr_str( mac, rp->mac_addr ), rvip,
                                sock_to_cstr( rsbuf, &rp->sock ), rver, ros,
                                N2N_NAT_NAME(rp->nat_type));
@@ -4511,7 +4486,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send statistics */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "----------------------------------------------------------------------------------------------------------------v2.3---\n");
+                       "------------------------------------------------------------------------------------------------------------------v2.3---\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -4578,7 +4553,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
            (struct sockaddr*) &sender_sock, i);
 
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "Type \"help\" to see more commands and notes.\n");
+                       "Type \"help\" to see more commands.\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 }
@@ -5555,39 +5530,22 @@ process_n2n_packet:
                         if ( ra.sock.family == AF_INET )
                         {
                             eee->nat_seen_sn2_alt = ra.sock;
-                            /* A late twin echo still sharpens a timed-out verdict. */
-                            if ( eee->nat_final && eee->nat_type != N2N_NAT_UNKNOWN &&
-                                 N2N_NAT_MAPPING( eee->nat_type ) == N2N_NAT_MAP_EIM )
-                            {
-                                eee->nat_final = 0;
-                                nat_classify( eee );
-                                eee->nat_final = 1;
-                            }
-                            else
-                                nat_classify( eee );
+                            nat_classify( eee );
                         }
                     }
                     else if ( eee->nat_probe_cross &&
                               eee->sn_query.family != 0 &&
                               sock_equal( &sender, &(eee->sn_query) ) == 0 )
                     {
-                        /* Cross-IP probe echo from sn2 (a distinct public IP):
-                         * splits EIM from ADM only. The within-IP twin remains
-                         * the APDM arbiter, so this can never create APDM. */
+                        /* Cross-IP probe echo from sn2 (a distinct public IP).
+                         * Confirms the port toward a second destination but is
+                         * never the NAT3/NAT4 arbiter (a NAT3 changes its port
+                         * per destination IP); stored separately. */
                         eee->last_sup = now;
                         if ( ra.sock.family == AF_INET )
                         {
                             eee->nat_seen_sn_cross = ra.sock;
-                            /* Cross evidence can still refine a frozen EIM verdict. */
-                            if ( eee->nat_final && eee->nat_type != N2N_NAT_UNKNOWN &&
-                                 N2N_NAT_MAPPING( eee->nat_type ) == N2N_NAT_MAP_EIM )
-                            {
-                                eee->nat_final = 0;
-                                nat_classify( eee );
-                                eee->nat_final = 1;
-                            }
-                            else
-                                nat_classify( eee ); /* confirmatory: usually unchanged */
+                            nat_classify( eee ); /* confirmatory: verdict unchanged, may log */
                         }
                     }
                     else if ( eee->sn1_probe_addr.family != 0 &&
@@ -5615,16 +5573,14 @@ process_n2n_packet:
                                     "sn1 back online - switching back to sn1");
                     }
 
-                    /* Freeze only once both twin echoes are in (else a per-IP-port
-                     * mapping NAT may freeze as APDM before its reuse is measured) */
+                    /* Freeze only once both twin echoes are in (else a per-IP-reuse NAT may freeze as symmetric) */
                     if ( was_sym_check &&
                          eee->nat_seen_sn2.family == AF_INET &&
                          eee->nat_seen_sn2_alt.family == AF_INET )
                     {
                         eee->nat_probe_pending = 0;
                         eee->nat_final = 1;
-                        traceEvent( TRACE_INFO, "NAT verdict frozen: %s / %s",
-                                    N2N_NAT_LEGACY_NAME( eee->nat_type ),
+                        traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
                                     N2N_NAT_NAME( eee->nat_type ) );
                     }
                 }
@@ -7438,7 +7394,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     /* Backup supernode is announced after the [OK] marker (line 4680+),
      * not at startup, so a still-resolving DNS name is not shown. */
-    traceEvent(TRACE_NORMAL, "NAT standard: RFC 3489 / 5780 (legacy / behaviour(rank))");
     traceEvent(TRACE_NORMAL, "Edge started");
 
     setup_upnp(&eee, local_port);

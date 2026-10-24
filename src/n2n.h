@@ -219,70 +219,34 @@ typedef char ipstr_t[INET6_ADDRSTRLEN];
 #define N2N_MACSTR_SIZE 32
 typedef char macstr_t[N2N_MACSTR_SIZE];
 
-/* RFC 5780 NAT behaviour: mapping x filtering, ranked 1..9 by hole-punch difficulty.
- * Measured with the dual-sn reflection (sn1 main/alt ports + cross-IP sn2). */
+/* NAT type from dual-sn reflection (mapping compare + helper-socket bounce + brother N2NF) */
 #define N2N_NAT_UNKNOWN        0
+#define N2N_NAT_SYMMETRIC      2
+#define N2N_NAT_FULL_CONE      3  /* N2NF probe from a never-contacted brother got through */
+#define N2N_NAT_RESTRICTED     4  /* addr-restr: helper bounce got through (incl. full cone w/o brother) */
+#define N2N_NAT_PORT_RESTRICT  5  /* no bounce despite requests */
 
-/* Mapping behaviour -- primary axis: does the public port survive a new destination? */
-#define N2N_NAT_MAP_EIM        0  /* endpoint-independent mapping */
-#define N2N_NAT_MAP_ADM        1  /* address-dependent mapping */
-#define N2N_NAT_MAP_APDM       2  /* address-and-port-dependent mapping */
+/* Shared display name for a N2N_NAT_* value ("unknown" when not measured). */
+#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_FULL_CONE ? "full-cone" : \
+                          (t) == N2N_NAT_RESTRICTED ? "addr-restr" : \
+                          (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
+                          (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
 
-/* Filtering behaviour -- secondary axis: which unsolicited sources get in? */
-#define N2N_NAT_FILT_EIF       0  /* endpoint-independent filtering */
-#define N2N_NAT_FILT_ADF       1  /* address-dependent filtering */
-#define N2N_NAT_FILT_APDF      2  /* address-and-port-dependent filtering */
+/* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
+ * PEER_INFO carries a peer's type to edges for mgmt display. */
+#define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
+                            (t) == N2N_NAT_RESTRICTED ? N2N_AFLAGS_NAT_RESTRICTED : \
+                            (t) == N2N_NAT_PORT_RESTRICT ? N2N_AFLAGS_NAT_PORT_RESTRICT : \
+                            (t) == N2N_NAT_SYMMETRIC ? N2N_AFLAGS_NAT_SYMMETRIC : 0 )
+#define N2N_NAT_FROM_AFLAGS(a) ( ((a) & N2N_AFLAGS_NAT_RESTRICTED) ? N2N_NAT_RESTRICTED : \
+                                 ((a) & N2N_AFLAGS_NAT_PORT_RESTRICT) ? N2N_NAT_PORT_RESTRICT : \
+                                 ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
+                                 ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
-/* Final rank: NAT1 (EIM+EIF, easiest) ... NAT9/9 (APDM+APDF, relay-only). */
-#define N2N_NAT_EIM_EIF        1
-#define N2N_NAT_EIM_ADF        2
-#define N2N_NAT_EIM_APDF       3
-#define N2N_NAT_ADM_EIF        4
-#define N2N_NAT_ADM_ADF        5
-#define N2N_NAT_ADM_APDF       6
-#define N2N_NAT_APDM_EIF       7
-#define N2N_NAT_APDM_ADF       8
-#define N2N_NAT_APDM_APDF      9
-#define N2N_NAT_MAX            9
-
-#define N2N_NAT_RANK(m,f)      ( (uint8_t)( (m) * 3 + (f) + 1 ) )
-#define N2N_NAT_MAPPING(t)     ( (uint8_t)( ( (t) - 1 ) / 3 ) )
-#define N2N_NAT_FILTERING(t)   ( (uint8_t)( ( (t) - 1 ) % 3 ) )
-
-/* Shared display name for a N2N_NAT_* value, used by mgmt and logs:
- * behaviour combination with its 1..9 hole-punch rank ("unknown" if not measured). */
-#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_EIM_EIF ? "EIM+EIF(1)" : \
-                          (t) == N2N_NAT_EIM_ADF ? "EIM+ADF(2)" : \
-                          (t) == N2N_NAT_EIM_APDF ? "EIM+APDF(3)" : \
-                          (t) == N2N_NAT_ADM_EIF ? "ADM+EIF(4)" : \
-                          (t) == N2N_NAT_ADM_ADF ? "ADM+ADF(5)" : \
-                          (t) == N2N_NAT_ADM_APDF ? "ADM+APDF(6)" : \
-                          (t) == N2N_NAT_APDM_EIF ? "APDM+EIF(7)" : \
-                          (t) == N2N_NAT_APDM_ADF ? "APDM+ADF(8)" : \
-                          (t) == N2N_NAT_APDM_APDF ? "APDM+APDF(9)" : "unknown" )
-
-/* Legacy RFC 3489 label for the startup log (no 3489 name exists for ADM rows). */
-#define N2N_NAT_LEGACY_NAME(t) ( (t) == N2N_NAT_EIM_EIF ? "full-cone" : \
-                                 (t) == N2N_NAT_EIM_ADF ? "addr-restr" : \
-                                 (t) == N2N_NAT_EIM_APDF ? "port-restr" : \
-                                 ( (t) >= N2N_NAT_ADM_EIF && (t) <= N2N_NAT_ADM_APDF ) ? "addr-dep-map" : \
-                                 ( (t) >= N2N_NAT_APDM_EIF ) ? "symmetric" : "unknown" )
-
-/* NAT rank <-> aflags bits: REGISTER_SUPER carries the edge's own rank,
- * PEER_INFO carries a peer's rank to edges for mgmt display. */
-#define N2N_NAT_AFLAGS(t) ( (uint16_t)( ( ( (t) & 1 ) ? N2N_AFLAGS_NAT_BIT0 : 0 ) | \
-                                        ( ( (t) & 2 ) ? N2N_AFLAGS_NAT_BIT1 : 0 ) | \
-                                        ( ( (t) & 4 ) ? N2N_AFLAGS_NAT_BIT2 : 0 ) | \
-                                        ( ( (t) & 8 ) ? N2N_AFLAGS_NAT_BIT3 : 0 ) ) )
-#define N2N_NAT_FROM_AFLAGS(a) ( (uint8_t)( ( ( (a) & N2N_AFLAGS_NAT_BIT0 ) ? 1 : 0 ) | \
-                                            ( ( (a) & N2N_AFLAGS_NAT_BIT1 ) ? 2 : 0 ) | \
-                                            ( ( (a) & N2N_AFLAGS_NAT_BIT2 ) ? 4 : 0 ) | \
-                                            ( ( (a) & N2N_AFLAGS_NAT_BIT3 ) ? 8 : 0 ) ) )
-
-/* Ranks reachable without punching: only EIM+EIF (NAT1) / EIM+ADF (NAT2)
- * qualify as community relay; stricter kinds fall back to the plain SN relay. */
-#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_EIM_EIF || \
-                                   (t) == N2N_NAT_EIM_ADF )
+/* NAT types reachable without punching: only full-cone (NAT1) / restricted-cone
+ * (NAT2) qualify as community relay; stricter kinds fall back to the plain SN relay. */
+#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
+                                   (t) == N2N_NAT_RESTRICTED )
 
 struct peer_info {
     struct peer_info *  next;
@@ -613,7 +577,7 @@ struct n2n_edge
     n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
     n2n_sock_t          nat_seen_sn2;   /* twin probe MAIN-port echo (also sn2 query ACK in failover) */
     n2n_sock_t          nat_seen_sn2_alt; /* alt-port echo: equal public ports prove per-IP mapping reuse */
-    n2n_sock_t          nat_seen_sn_cross; /* echo from a distinct public IP: splits EIM (same port) from ADM (new port) */
+    n2n_sock_t          nat_seen_sn_cross; /* echo from a distinct public IP; confirmatory only (NAT3 varies port per destination) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
     uint8_t             nat_probe_cross;   /* 1: cross-IP probe to sn2 fired this round; routes its ACK to nat_seen_sn_cross */

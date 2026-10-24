@@ -171,16 +171,16 @@ typedef struct n2n_PACKET n2n_PACKET_t;
                                              re-registration: the sn uses it to trigger
                                              the pair handoff only for these, never for
                                              the plain periodic re-registrations */
-/* RFC 5780 rank (1..9) travels as a 4-bit field in these bits, LSB first.
- * Edge -> sn in REGISTER_SUPER, sn -> edge in PEER_INFO (mgmt display). */
-#define N2N_AFLAGS_NAT_BIT0       0x0040  /* rank bit 0 (value 1) */
+#define N2N_AFLAGS_NAT_SYMMETRIC  0x0040  /* edge reports symmetric NAT (dual-sn reflection) */
 #define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test:
                                              sn replies from an extra helper socket
                                              (different source port, outbound-only)
                                              with the 4-byte magic "N2NB" */
-#define N2N_AFLAGS_NAT_BIT1       0x0100  /* rank bit 1 (value 2) */
-#define N2N_AFLAGS_NAT_BIT2       0x0200  /* rank bit 2 (value 4) */
-#define N2N_AFLAGS_NAT_BIT3       0x0400  /* rank bit 3 (value 8) */
+#define N2N_AFLAGS_NAT_FULL_CONE  0x0100  /* edge reports full-cone NAT
+                                             (proved by an "N2NF" probe from the
+                                             brother sn, a never-contacted source) */
+#define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
+#define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
 #define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge refuses to act as the relay (SN never picks it) */
 #define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as the relay (SN prefers it) */
