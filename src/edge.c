@@ -2617,7 +2617,6 @@ static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
 
 static void nat_classify( n2n_edge_t * eee )
 {
-    const char *old_3489, *new_3489, *old_5780, *new_5780;
     uint8_t new_type, mapping, filtering;
     int pub1, pub2, pubc, have_alt, have_cross, mapping_known;
 
@@ -2698,16 +2697,11 @@ static void nat_classify( n2n_edge_t * eee )
     if ( new_type == eee->nat_type )
         return;
 
-    old_3489 = N2N_NAT_LEGACY_NAME( eee->nat_type );
-    new_3489 = N2N_NAT_LEGACY_NAME( new_type );
-    old_5780 = N2N_NAT_NAME( eee->nat_type );
-    new_5780 = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    /* Both standards are reported at startup: the legacy RFC 3489 label for
-     * familiarity, the RFC 5780 rank that mgmt and the SN actually use. */
-    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old_3489, new_3489 );
-    traceEvent( TRACE_NORMAL, "NAT type (RFC 5780): %s -> %s", old_5780, new_5780 );
+    /* One combined line: legacy RFC 3489 label first, RFC 5780 behaviour(rank) second. */
+    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489 / 5780): %s / %s",
+                N2N_NAT_LEGACY_NAME( new_type ), N2N_NAT_NAME( new_type ) );
 
     /* Push the fresh NAT type to the SN right away so its relay-eligibility
      * decision never lags. The SN alone decides who relays (PEER_INFO RELAY). */
@@ -5617,9 +5611,9 @@ process_n2n_packet:
                     {
                         eee->nat_probe_pending = 0;
                         eee->nat_final = 1;
-                        traceEvent( TRACE_INFO, "NAT verdict frozen: %s (%s)",
-                                    N2N_NAT_NAME( eee->nat_type ),
-                                    N2N_NAT_LEGACY_NAME( eee->nat_type ) );
+                        traceEvent( TRACE_INFO, "NAT verdict frozen: %s / %s",
+                                    N2N_NAT_LEGACY_NAME( eee->nat_type ),
+                                    N2N_NAT_NAME( eee->nat_type ) );
                     }
                 }
                 else if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
@@ -7432,7 +7426,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     /* Backup supernode is announced after the [OK] marker (line 4680+),
      * not at startup, so a still-resolving DNS name is not shown. */
-    traceEvent(TRACE_NORMAL, "NAT standard: RFC 5780 (NATn/9) + RFC 3489 legacy label");
+    traceEvent(TRACE_NORMAL, "NAT standard: RFC 3489 / 5780 (legacy / behaviour(rank))");
     traceEvent(TRACE_NORMAL, "Edge started");
 
     setup_upnp(&eee, local_port);

@@ -249,16 +249,17 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
 #define N2N_NAT_MAPPING(t)     ( (uint8_t)( ( (t) - 1 ) / 3 ) )
 #define N2N_NAT_FILTERING(t)   ( (uint8_t)( ( (t) - 1 ) % 3 ) )
 
-/* Shared display name for a N2N_NAT_* value ("unknown" when not measured). */
-#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_EIM_EIF ? "NAT1/9 EIM+EIF" : \
-                          (t) == N2N_NAT_EIM_ADF ? "NAT2/9 EIM+ADF" : \
-                          (t) == N2N_NAT_EIM_APDF ? "NAT3/9 EIM+APDF" : \
-                          (t) == N2N_NAT_ADM_EIF ? "NAT4/9 ADM+EIF" : \
-                          (t) == N2N_NAT_ADM_ADF ? "NAT5/9 ADM+ADF" : \
-                          (t) == N2N_NAT_ADM_APDF ? "NAT6/9 ADM+APDF" : \
-                          (t) == N2N_NAT_APDM_EIF ? "NAT7/9 APDM+EIF" : \
-                          (t) == N2N_NAT_APDM_ADF ? "NAT8/9 APDM+ADF" : \
-                          (t) == N2N_NAT_APDM_APDF ? "NAT9/9 APDM+APDF" : "unknown" )
+/* Shared display name for a N2N_NAT_* value, used by mgmt and logs:
+ * behaviour combination with its 1..9 hole-punch rank ("unknown" if not measured). */
+#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_EIM_EIF ? "EIM+EIF(1)" : \
+                          (t) == N2N_NAT_EIM_ADF ? "EIM+ADF(2)" : \
+                          (t) == N2N_NAT_EIM_APDF ? "EIM+APDF(3)" : \
+                          (t) == N2N_NAT_ADM_EIF ? "ADM+EIF(4)" : \
+                          (t) == N2N_NAT_ADM_ADF ? "ADM+ADF(5)" : \
+                          (t) == N2N_NAT_ADM_APDF ? "ADM+APDF(6)" : \
+                          (t) == N2N_NAT_APDM_EIF ? "APDM+EIF(7)" : \
+                          (t) == N2N_NAT_APDM_ADF ? "APDM+ADF(8)" : \
+                          (t) == N2N_NAT_APDM_APDF ? "APDM+APDF(9)" : "unknown" )
 
 /* Legacy RFC 3489 label for the startup log (no 3489 name exists for ADM rows). */
 #define N2N_NAT_LEGACY_NAME(t) ( (t) == N2N_NAT_EIM_EIF ? "full-cone" : \
