@@ -1424,7 +1424,7 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             /* have_v4 || have_v6 holds above, so a stamp is always set. */
             time_t last = b->seen ? b->seen : b->seen6;
 
-            char label[8];
+            char label[12];
             if (marker)
                 snprintf(label, sizeof(label), "%s", marker);
             else
